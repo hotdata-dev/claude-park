@@ -1,0 +1,774 @@
+#!/usr/bin/env python3
+"""claude-park: park idle Claude Code sessions and resume them later.
+
+Parking runs entirely outside the parked session's model, so a stale,
+uncached session with a huge context is never re-sent just to be shelved.
+A cheap model (Haiku by default) summarizes a trimmed transcript excerpt
+in the background.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+# Ignored directories that are safe to delete because a build or install
+# recreates them. Only paths git reports as ignored are ever considered.
+REBUILDABLE = {
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".next",
+    ".turbo",
+    ".nuxt",
+    ".svelte-kit",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".gradle",
+    "__pycache__",
+}
+
+EXCERPT_BUDGET = 60_000
+TURN_LIMIT = 3_000
+NOISE_PREFIXES = (
+    "<command-name>",
+    "<command-message>",
+    "<local-command-",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<task-notification>",
+    "[Request interrupted",
+    "Caveat:",
+)
+REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+SUMMARY_PROMPT = """You are writing a "park card" so a developer can pick up \
+this Claude Code session again weeks from now. Below is an excerpt of the \
+session transcript (the opening request, any compaction summary, and the most \
+recent turns).
+
+Write Markdown with exactly these sections and nothing else:
+
+**Goal** — one or two sentences on what the session is trying to achieve.
+**Done** — bullets of what is finished.
+**Next** — bullets of concrete next steps, most important first.
+**Gotchas** — bullets of open questions, blockers, or context that would be \
+easy to forget. Write "None" if there are none.
+
+Be specific: name files, branches, PRs, commands, and decisions. No preamble.
+
+<transcript>
+{excerpt}
+</transcript>
+"""
+
+
+class ParkError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- paths
+
+
+def claude_home() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def park_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_PARK_DIR") or claude_home() / "parked")
+
+
+def archive_dir() -> Path:
+    return park_dir() / "archive"
+
+
+def record_path(session_id: str) -> Path:
+    return park_dir() / f"{session_id}.json"
+
+
+def claude_bin() -> str:
+    return os.environ.get("CLAUDE_PARK_CLAUDE") or "claude"
+
+
+def now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+# ---------------------------------------------------------------- transcript
+
+
+def find_transcript(session_id: str) -> Optional[Path]:
+    matches = list((claude_home() / "projects").glob(f"*/{session_id}.jsonl"))
+    if not matches:
+        return None
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+def message_text(entry: dict) -> str:
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        parts = [content]
+    elif isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+    else:
+        parts = []
+    return REMINDER_RE.sub("", "\n".join(parts)).strip()
+
+
+def read_transcript(path: Path) -> dict:
+    info = {
+        "custom_title": None,
+        "ai_title": None,
+        "last_prompt": None,
+        "cwd": None,
+        "branch": None,
+        "first_prompt": None,
+        "compact_summary": None,
+        "turns": [],
+    }
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            kind = entry.get("type")
+            if kind == "custom-title":
+                info["custom_title"] = entry.get("customTitle") or info["custom_title"]
+            elif kind == "ai-title":
+                info["ai_title"] = entry.get("aiTitle") or info["ai_title"]
+            elif kind == "last-prompt":
+                info["last_prompt"] = entry.get("lastPrompt") or info["last_prompt"]
+            elif kind in ("user", "assistant"):
+                if entry.get("isSidechain"):
+                    continue
+                if entry.get("cwd"):
+                    info["cwd"] = entry["cwd"]
+                    info["branch"] = entry.get("gitBranch") or info["branch"]
+                text = message_text(entry)
+                if not text:
+                    continue
+                if kind == "user":
+                    if entry.get("isCompactSummary"):
+                        info["compact_summary"] = text
+                        continue
+                    if entry.get("isMeta") or text.startswith(NOISE_PREFIXES):
+                        continue
+                    if info["first_prompt"] is None:
+                        info["first_prompt"] = text
+                info["turns"].append((kind, text))
+    return info
+
+
+def clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + " …[truncated]"
+
+
+def build_excerpt(info: dict, budget: int = EXCERPT_BUDGET) -> str:
+    head = []
+    if info["first_prompt"]:
+        head.append("## Opening request\n" + clip(info["first_prompt"], 4_000))
+    if info["compact_summary"]:
+        head.append("## Earlier context (compaction summary)\n"
+                    + clip(info["compact_summary"], 15_000))
+    used = sum(len(h) for h in head)
+
+    tail: List[str] = []
+    for kind, text in reversed(info["turns"]):
+        block = f"### {kind}\n{clip(text, TURN_LIMIT)}"
+        if used + len(block) > budget:
+            break
+        tail.append(block)
+        used += len(block)
+    tail.reverse()
+    if tail:
+        head.append("## Most recent turns\n" + "\n\n".join(tail))
+    return "\n\n".join(head)
+
+
+# ---------------------------------------------------------------- git
+
+
+def git(cwd: str, *args: str, check: bool = False) -> Tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if check:
+            raise ParkError(f"git {' '.join(args)} failed: {e}")
+        return 1, ""
+    if check and proc.returncode != 0:
+        raise ParkError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc.returncode, proc.stdout.strip()
+
+
+def git_info(cwd: str) -> dict:
+    code, top = git(cwd, "rev-parse", "--show-toplevel")
+    if code != 0:
+        return {"repo": False}
+    _, git_dir = git(cwd, "rev-parse", "--absolute-git-dir")
+    _, common = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    _, branch = git(cwd, "branch", "--show-current")
+    _, status = git(cwd, "status", "--porcelain")
+    _, last = git(cwd, "log", "-1", "--format=%h %s")
+    code, ahead = git(cwd, "rev-list", "--count", "origin/HEAD..HEAD")
+    return {
+        "repo": True,
+        "toplevel": top,
+        "repo_name": Path(common).parent.name if common else Path(top).name,
+        "linked_worktree": bool(git_dir and common and
+                                Path(git_dir).resolve() != Path(common).resolve()),
+        "branch": branch or None,
+        "dirty_files": len(status.splitlines()) if status else 0,
+        "last_commit": last or None,
+        "ahead": int(ahead) if code == 0 and ahead.isdigit() else None,
+    }
+
+
+def worktree_lock_reason(toplevel: str) -> Optional[str]:
+    """Return the lock reason ("" if locked without one), or None if unlocked."""
+    _, out = git(toplevel, "worktree", "list", "--porcelain")
+    target = Path(toplevel).resolve()
+    current = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):]).resolve()
+        elif current == target and line.startswith("locked"):
+            return line[len("locked"):].strip()
+    return None
+
+
+def pr_info(cwd: str) -> Optional[dict]:
+    if not shutil.which("gh"):
+        return None
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", "--json", "number,url,state,title"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return None
+
+
+def clean_build_dirs(toplevel: str) -> List[dict]:
+    """Delete gitignored, rebuildable directories under the worktree."""
+    _, out = git(toplevel, "ls-files", "--others", "--ignored",
+                 "--exclude-standard", "--directory")
+    removed = []
+    for rel in out.splitlines():
+        rel = rel.rstrip("/")
+        if Path(rel).name not in REBUILDABLE:
+            continue
+        path = Path(toplevel) / rel
+        if not path.is_dir() or path.is_symlink():
+            continue
+        size = dir_size(path)
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append({"path": rel, "bytes": size})
+    return removed
+
+
+def dir_size(path: Path) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+# ---------------------------------------------------------------- records
+
+
+def save_record(record: dict) -> None:
+    park_dir().mkdir(parents=True, exist_ok=True)
+    path = record_path(record["session_id"])
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(record, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def load_record(session_id: str) -> dict:
+    path = record_path(session_id)
+    if not path.exists():
+        raise ParkError(f"no parked session {session_id}")
+    return json.loads(path.read_text())
+
+
+def all_records() -> List[dict]:
+    if not park_dir().exists():
+        return []
+    records = []
+    for path in park_dir().glob("*.json"):
+        try:
+            records.append(json.loads(path.read_text()))
+        except ValueError:
+            continue
+    return sorted(records, key=lambda r: r["parked_at"], reverse=True)
+
+
+def resolve(query: str) -> dict:
+    records = all_records()
+    for r in records:
+        if r["session_id"] == query:
+            return r
+    hits = [r for r in records if r["session_id"].startswith(query)]
+    if not hits:
+        q = query.lower()
+        hits = [r for r in records if q in (r.get("title") or "").lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise ParkError(f"no parked session matches {query!r}")
+    names = ", ".join(f"{r['session_id'][:8]} ({r.get('title')})" for r in hits)
+    raise ParkError(f"{query!r} is ambiguous: {names}")
+
+
+def age(iso: str) -> str:
+    delta = now() - datetime.datetime.fromisoformat(iso)
+    days = delta.days
+    if days >= 1:
+        return f"{days}d"
+    hours = delta.seconds // 3600
+    return f"{hours}h" if hours else f"{delta.seconds // 60}m"
+
+
+def human_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
+
+
+def render_card(r: dict) -> str:
+    lines = [f"# {r.get('title') or r['session_id']}", ""]
+    g = r.get("git") or {}
+    lines.append(f"- parked: {r['parked_at'][:16].replace('T', ' ')} UTC ({age(r['parked_at'])} ago)")
+    lines.append(f"- dir: {r['cwd']}")
+    if g.get("branch"):
+        extra = []
+        if g.get("ahead") is not None:
+            extra.append(f"{g['ahead']} ahead of origin")
+        if g.get("dirty_files"):
+            extra.append(f"{g['dirty_files']} uncommitted")
+        suffix = f" ({', '.join(extra)})" if extra else ""
+        lines.append(f"- branch: {g['branch']}{suffix}")
+    if g.get("last_commit"):
+        lines.append(f"- last commit: {g['last_commit']}")
+    if r.get("pr"):
+        pr = r["pr"]
+        lines.append(f"- PR #{pr['number']} [{pr['state']}]: {pr['title']} {pr['url']}")
+    if r.get("cleaned"):
+        total = sum(c["bytes"] for c in r["cleaned"])
+        paths = ", ".join(c["path"] for c in r["cleaned"])
+        lines.append(f"- cleaned {human_bytes(total)}: {paths} (rebuild before running)")
+    lines.append(f"- session: {r['session_id']}")
+    lines.append("")
+    status = r.get("summary_status")
+    if r.get("summary"):
+        lines.append(r["summary"])
+    elif status == "pending":
+        lines.append("_Summary is being generated…_")
+    elif status == "failed":
+        lines.append(f"_Summary failed: {r.get('summary_error', 'unknown error')}_")
+    if r.get("last_prompt"):
+        lines += ["", "**Last prompt**", "", "> " + clip(r["last_prompt"], 600).replace("\n", "\n> ")]
+    return "\n".join(lines) + "\n"
+
+
+def goal_line(r: dict) -> str:
+    summary = r.get("summary") or ""
+    m = re.search(r"\*\*Goal\*\*[\s—:-]*(.+)", summary)
+    if m:
+        return m.group(1).strip()
+    return (r.get("last_prompt") or "").splitlines()[0] if r.get("last_prompt") else ""
+
+
+# ---------------------------------------------------------------- iTerm2
+
+
+def iterm_uuid() -> Optional[str]:
+    sid = os.environ.get("ITERM_SESSION_ID", "")
+    return sid.split(":", 1)[1] if ":" in sid else None
+
+
+def osascript(script: str) -> None:
+    subprocess.run(["osascript", "-e", script], capture_output=True, timeout=30)
+
+
+def spawn_detached(argv: List[str], log: Optional[Path] = None) -> None:
+    out = open(log, "a") if log else subprocess.DEVNULL
+    subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=out,
+        stderr=out,
+        start_new_session=True,
+    )
+
+
+def schedule_close(claude_pid: Optional[str], uuid: Optional[str], delay: float) -> None:
+    """Stop the parked Claude process, then close its iTerm2 pane.
+
+    Runs detached so it survives the pane closing underneath it.
+    """
+    steps = [f"sleep {delay}"]
+    if claude_pid and claude_pid.isdigit():
+        steps.append(f"kill -TERM {claude_pid} 2>/dev/null; sleep 1")
+    if uuid:
+        script = (
+            'tell application "iTerm2" to repeat with w in windows\n'
+            "repeat with t in tabs of w\n"
+            "repeat with s in sessions of t\n"
+            f'if unique id of s is "{uuid}" then close s\n'
+            "end repeat\nend repeat\nend repeat"
+        )
+        steps.append("osascript -e " + shlex.quote(script))
+    spawn_detached(["sh", "-c", "; ".join(steps)])
+
+
+def open_iterm_tab(command: str) -> None:
+    escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+    osascript(
+        'tell application "iTerm2"\n'
+        "if (count of windows) is 0 then\n"
+        "create window with default profile\n"
+        "else\n"
+        "tell current window to create tab with default profile\n"
+        "end if\n"
+        f'tell current session of current window to write text "{escaped}"\n'
+        "end tell"
+    )
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_park(args) -> int:
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session_id:
+        raise ParkError("no session id: run this as `!park` inside Claude Code, or pass --session")
+    transcript = find_transcript(session_id)
+    if not transcript:
+        raise ParkError(f"no transcript found for session {session_id}")
+    info = read_transcript(transcript)
+    cwd = info["cwd"] or os.getcwd()
+    if not Path(cwd).is_dir():
+        cwd = os.getcwd()
+
+    g = git_info(cwd)
+    record = {
+        "session_id": session_id,
+        "title": info["custom_title"] or info["ai_title"] or clip(info["first_prompt"] or session_id, 80),
+        "parked_at": now().isoformat(timespec="seconds"),
+        "cwd": cwd,
+        "transcript": str(transcript),
+        "first_prompt": clip(info["first_prompt"] or "", 2_000),
+        "last_prompt": clip(info["last_prompt"] or "", 2_000),
+        "git": g,
+        "pr": pr_info(cwd) if g.get("repo") and not args.no_pr else None,
+        "locked_by_park": False,
+        "cleaned": [],
+        "summary": None,
+        "summary_status": "skipped",
+    }
+
+    if g.get("linked_worktree"):
+        if worktree_lock_reason(g["toplevel"]) is None:
+            reason = f"claude-park: parked session {session_id} ({record['title']}) on {record['parked_at'][:10]}"
+            git(g["toplevel"], "worktree", "lock", "--reason", reason, g["toplevel"], check=True)
+            record["locked_by_park"] = True
+
+    if args.clean and g.get("repo"):
+        record["cleaned"] = clean_build_dirs(g["toplevel"])
+
+    if args.summary_file:
+        text = sys.stdin.read() if args.summary_file == "-" else Path(args.summary_file).read_text()
+        record["summary"] = text.strip()
+        record["summary_status"] = "done"
+    elif not args.no_summary:
+        record["summary_status"] = "pending"
+    save_record(record)
+
+    if record["summary_status"] == "pending":
+        logs = park_dir() / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        spawn_detached([sys.executable, os.path.abspath(__file__), "summarize", session_id],
+                       log=logs / f"{session_id}.log")
+
+    print(f"parked: {record['title']}")
+    if record["locked_by_park"]:
+        print(f"  locked worktree {g['toplevel']}")
+    if record["cleaned"]:
+        total = sum(c["bytes"] for c in record["cleaned"])
+        print(f"  freed {human_bytes(total)}: {', '.join(c['path'] for c in record['cleaned'])}")
+    print("  resume with: parked")
+
+    if not args.no_close and os.environ.get("CLAUDE_PARK_NO_CLOSE") != "1":
+        uuid = iterm_uuid()
+        if uuid or os.environ.get("CLAUDE_PID"):
+            schedule_close(os.environ.get("CLAUDE_PID"), uuid, args.close_delay)
+            print("  closing this tab…")
+    return 0
+
+
+def cmd_summarize(args) -> int:
+    record = load_record(args.session)
+    transcript = Path(record["transcript"])
+    excerpt = build_excerpt(read_transcript(transcript))
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CLAUDE_CODE_") and k not in ("CLAUDECODE", "CLAUDE_PID")}
+    argv = [
+        claude_bin(), "-p",
+        "--model", os.environ.get("CLAUDE_PARK_MODEL", "haiku"),
+        "--no-session-persistence",
+        "--setting-sources", "",
+        "--strict-mcp-config",
+        "--tools", "",
+    ]
+    try:
+        proc = subprocess.run(
+            argv,
+            input=SUMMARY_PROMPT.format(excerpt=excerpt),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+            cwd=str(park_dir()),
+        )
+        ok = proc.returncode == 0 and proc.stdout.strip()
+        error = (proc.stderr or proc.stdout).strip()[-500:]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        proc, ok, error = None, False, str(e)
+
+    # Re-read: the session may have been resumed or re-parked meanwhile.
+    try:
+        record = load_record(args.session)
+    except ParkError:
+        return 0
+    if ok:
+        record["summary"] = proc.stdout.strip()
+        record["summary_status"] = "done"
+        record.pop("summary_error", None)
+    else:
+        record["summary_status"] = "failed"
+        record["summary_error"] = error or "empty response"
+    save_record(record)
+    return 0 if ok else 1
+
+
+def list_rows(records: List[dict]) -> List[str]:
+    rows = []
+    for r in records:
+        g = r.get("git") or {}
+        where = g.get("repo_name") or Path(r["cwd"]).name
+        if g.get("branch"):
+            where += f":{g['branch']}"
+        rows.append("\t".join([
+            r["session_id"],
+            f"{age(r['parked_at']):>4}",
+            clip(r.get("title") or "", 50),
+            where,
+            clip(goal_line(r), 100),
+        ]))
+    return rows
+
+
+def cmd_list(args) -> int:
+    records = all_records()
+    if args.json:
+        print(json.dumps(records, indent=2))
+        return 0
+    if not records:
+        print("no parked sessions")
+        return 0
+    for row in list_rows(records):
+        sid, ago, title, where, goal = row.split("\t")
+        print(f"{sid[:8]}  {ago}  {title:<50}  {where}")
+        if goal:
+            print(f"{'':16}{goal}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    sys.stdout.write(render_card(resolve(args.session)))
+    return 0
+
+
+def unpark(record: dict) -> None:
+    g = record.get("git") or {}
+    if record.get("locked_by_park") and g.get("toplevel") and Path(g["toplevel"]).is_dir():
+        reason = worktree_lock_reason(g["toplevel"])
+        if reason is not None and reason.startswith("claude-park:"):
+            git(g["toplevel"], "worktree", "unlock", g["toplevel"])
+    archive_dir().mkdir(parents=True, exist_ok=True)
+    record["unparked_at"] = now().isoformat(timespec="seconds")
+    (archive_dir() / f"{record['session_id']}.json").write_text(json.dumps(record, indent=2) + "\n")
+    record_path(record["session_id"]).unlink(missing_ok=True)
+
+
+def fresh_prompt(record: dict) -> str:
+    return (
+        "You are picking up work from an earlier Claude Code session that was "
+        "parked. Here is its park card:\n\n" + render_card(record) +
+        "\nStart by checking the current state (git status, branch, PR) against "
+        "the card, then summarize where things stand and propose the next step."
+    )
+
+
+def cmd_resume(args) -> int:
+    record = resolve(args.session)
+    cwd = record["cwd"]
+    if not Path(cwd).is_dir():
+        raise ParkError(f"{cwd} no longer exists; restore the worktree first "
+                        f"(branch {(record.get('git') or {}).get('branch')})")
+    if args.fresh:
+        argv = [claude_bin(), fresh_prompt(record)]
+    else:
+        argv = [claude_bin(), "--resume", record["session_id"]]
+    unpark(record)
+    if record.get("cleaned"):
+        print(f"note: build dirs were cleaned ({', '.join(c['path'] for c in record['cleaned'])})")
+
+    if args.tab:
+        open_iterm_tab(f"cd {shlex.quote(cwd)} && {shlex.join(argv)}")
+        return 0
+    os.chdir(cwd)
+    os.execvp(argv[0], argv)
+
+
+def cmd_drop(args) -> int:
+    record = resolve(args.session)
+    unpark(record)
+    print(f"dropped: {record.get('title')} (archived; worktree unlocked)")
+    return 0
+
+
+def cmd_pick(args) -> int:
+    records = all_records()
+    if not records:
+        print("no parked sessions")
+        return 0
+    if not shutil.which("fzf"):
+        cmd_list(args)
+        print("\ninstall fzf for an interactive picker, or run: parked resume <id|title>")
+        return 0
+    self_cmd = shlex.quote(os.path.abspath(__file__))
+    proc = subprocess.run(
+        [
+            "fzf",
+            "--delimiter", "\t",
+            "--with-nth", "2..",
+            "--no-sort",
+            "--expect", "enter,ctrl-t,ctrl-f,ctrl-x",
+            "--header", "enter: resume here · ctrl-t: resume in new tab · ctrl-f: fresh session · ctrl-x: drop",
+            "--preview", f"{self_cmd} show {{1}}",
+            "--preview-window", "right,60%,wrap",
+        ],
+        input="\n".join(list_rows(records)) + "\n",
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    lines = proc.stdout.splitlines()
+    if proc.returncode != 0 or len(lines) < 2:
+        return 0
+    key, session_id = lines[0], lines[1].split("\t", 1)[0]
+    if key == "ctrl-x":
+        return cmd_drop(argparse.Namespace(session=session_id))
+    return cmd_resume(argparse.Namespace(
+        session=session_id, tab=key == "ctrl-t", fresh=key == "ctrl-f"))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="claude-park", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="command")
+
+    park = sub.add_parser("park", help="park the current session (run as `!park` in Claude Code)")
+    park.add_argument("--clean", action="store_true", help="delete gitignored, rebuildable build dirs")
+    park.add_argument("--no-close", action="store_true", help="leave the session and tab open")
+    park.add_argument("--no-summary", action="store_true", help="skip the background Haiku summary")
+    park.add_argument("--no-pr", action="store_true", help="skip the GitHub PR lookup")
+    park.add_argument("--summary-file", help="use this summary instead of generating one ('-' for stdin)")
+    park.add_argument("--session", help="session id (default: $CLAUDE_CODE_SESSION_ID)")
+    park.add_argument("--close-delay", type=float, default=1.5, help=argparse.SUPPRESS)
+    park.set_defaults(func=cmd_park)
+
+    summarize = sub.add_parser("summarize", help="(re)generate a parked session's summary")
+    summarize.add_argument("session")
+    summarize.set_defaults(func=lambda a: cmd_summarize(
+        argparse.Namespace(session=resolve(a.session)["session_id"])))
+
+    ls = sub.add_parser("list", aliases=["ls"], help="list parked sessions")
+    ls.add_argument("--json", action="store_true")
+    ls.set_defaults(func=cmd_list)
+
+    show = sub.add_parser("show", help="print a parked session's card")
+    show.add_argument("session")
+    show.set_defaults(func=cmd_show)
+
+    resume = sub.add_parser("resume", help="resume a parked session")
+    resume.add_argument("session", help="session id, id prefix, or title substring")
+    resume.add_argument("--tab", action="store_true", help="resume in a new iTerm2 tab")
+    resume.add_argument("--fresh", action="store_true",
+                        help="start a new session seeded with the park card instead of the full history")
+    resume.set_defaults(func=cmd_resume)
+
+    drop = sub.add_parser("drop", help="unpark without resuming (unlocks the worktree)")
+    drop.add_argument("session")
+    drop.set_defaults(func=cmd_drop)
+
+    pick = sub.add_parser("pick", help="interactive picker (default)")
+    pick.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    pick.set_defaults(func=cmd_pick)
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    prog = os.path.basename(sys.argv[0])
+    if prog == "park" and (not argv or argv[0].startswith("-")):
+        argv = ["park", *argv]
+    elif not argv:
+        argv = ["pick"]
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except ParkError as e:
+        print(f"claude-park: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
