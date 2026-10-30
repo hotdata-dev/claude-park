@@ -110,8 +110,8 @@ git facts about its worktree. Return only a JSON object, no prose:
 {{"title": "...", "phase": "...", "status": "...", "next": ["...", "..."]}}
 
 - title: at most 6 words and 40 characters naming the work itself: the \
-feature, bug, or question. Never generic ("Prior session next steps", \
-"Issue 2277", "Review session abc"); say what it is actually about.
+feature, bug, or question. Never generic ("Next steps for the prior session", \
+"Issue 123", "Review session abc"); say what it is actually about.
 - phase: how far along the overall task is, one of: research \
 (investigating), design (choosing an approach, writing a plan), build \
 (implementing), review (PR open, addressing feedback, validating), wrap-up \
