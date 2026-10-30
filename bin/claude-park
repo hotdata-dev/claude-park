@@ -71,6 +71,32 @@ Be specific: name files, branches, PRs, commands, and decisions. No preamble.
 </transcript>
 """
 
+UPDATE_PROMPT = """You maintain a "park card" so a developer can pick up \
+this Claude Code session again weeks from now. The session was parked before, \
+resumed, and is being parked again. Below is the previous card and the \
+transcript turns added since it was written.
+
+Rewrite the card so it reflects the current state. Keep everything from the \
+previous card that is still true, move finished work from Next to Done, drop \
+what is obsolete, and add what is new. Use exactly the same sections:
+
+**Goal** — one or two sentences on what the session is trying to achieve.
+**Done** — bullets of what is finished.
+**Next** — bullets of concrete next steps, most important first.
+**Gotchas** — bullets of open questions, blockers, or context that would be \
+easy to forget. Write "None" if there are none.
+
+Be specific: name files, branches, PRs, commands, and decisions. No preamble.
+
+<previous_card>
+{card}
+</previous_card>
+
+<new_turns>
+{excerpt}
+</new_turns>
+"""
+
 
 class ParkError(Exception):
     pass
@@ -187,18 +213,28 @@ def build_excerpt(info: dict, budget: int = EXCERPT_BUDGET) -> str:
         head.append("## Earlier context (compaction summary)\n"
                     + clip(info["compact_summary"], 15_000))
     used = sum(len(h) for h in head)
+    tail = recent_turns(info["turns"], budget - used)
+    if tail:
+        head.append("## Most recent turns\n" + tail)
+    return "\n\n".join(head)
 
+
+def build_update_excerpt(info: dict, since: int, budget: int = EXCERPT_BUDGET) -> str:
+    """Only the turns added after the previous park, newest kept first."""
+    return recent_turns(info["turns"][since:], budget)
+
+
+def recent_turns(turns: List[Tuple[str, str]], budget: int) -> str:
     tail: List[str] = []
-    for kind, text in reversed(info["turns"]):
+    used = 0
+    for kind, text in reversed(turns):
         block = f"### {kind}\n{clip(text, TURN_LIMIT)}"
         if used + len(block) > budget:
             break
         tail.append(block)
         used += len(block)
     tail.reverse()
-    if tail:
-        head.append("## Most recent turns\n" + "\n\n".join(tail))
-    return "\n\n".join(head)
+    return "\n\n".join(tail)
 
 
 # ---------------------------------------------------------------- git
@@ -325,6 +361,22 @@ def load_record(session_id: str) -> dict:
     return json.loads(path.read_text())
 
 
+def previous_card(session_id: str) -> Optional[dict]:
+    """The last summarized card for this session, parked or archived."""
+    for path in (record_path(session_id), archive_dir() / f"{session_id}.json"):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if record.get("summary_base"):
+            # A failed update: the card only covers turns up to the base.
+            return dict(record, summary=record["summary_base"],
+                        turn_count=record.get("summary_base_turns") or 0)
+        if record.get("summary") and record.get("turn_count") is not None:
+            return record
+    return None
+
+
 def all_records() -> List[dict]:
     if not park_dir().exists():
         return []
@@ -397,8 +449,14 @@ def render_card(r: dict) -> str:
     lines.append(f"- session: {r['session_id']}")
     lines.append("")
     status = r.get("summary_status")
+    if status == "stale":
+        lines += [f"_Card predates the latest turns; update failed: {r.get('summary_error')}_", ""]
+    elif status == "pending" and r.get("summary_base"):
+        lines += ["_Updating card with the latest turns…_", ""]
     if r.get("summary"):
         lines.append(r["summary"])
+    elif r.get("summary_base"):
+        lines.append(r["summary_base"])
     elif status == "pending":
         lines.append("_Summary is being generated…_")
     elif status == "failed":
@@ -497,6 +555,7 @@ def cmd_park(args) -> int:
         "transcript": str(transcript),
         "first_prompt": clip(info["first_prompt"] or "", 2_000),
         "last_prompt": clip(info["last_prompt"] or "", 2_000),
+        "turn_count": len(info["turns"]),
         "git": g,
         "pr": pr_info(cwd) if g.get("repo") and not args.no_pr else None,
         "locked_by_park": False,
@@ -519,7 +578,18 @@ def cmd_park(args) -> int:
         record["summary"] = text.strip()
         record["summary_status"] = "done"
     elif not args.no_summary:
-        record["summary_status"] = "pending"
+        prev = previous_card(session_id)
+        if prev and record["turn_count"] <= prev["turn_count"]:
+            # Nothing happened since the last park: the card still holds.
+            record["summary"] = prev["summary"]
+            record["summary_status"] = "done"
+            record["turn_count"] = prev["turn_count"]
+            print("  reusing previous card (no new turns)")
+        else:
+            record["summary_status"] = "pending"
+            if prev:
+                record["summary_base"] = prev["summary"]
+                record["summary_base_turns"] = prev["turn_count"]
     save_record(record)
 
     if record["summary_status"] == "pending":
@@ -546,8 +616,13 @@ def cmd_park(args) -> int:
 
 def cmd_summarize(args) -> int:
     record = load_record(args.session)
-    transcript = Path(record["transcript"])
-    excerpt = build_excerpt(read_transcript(transcript))
+    info = read_transcript(Path(record["transcript"]))
+    base = record.get("summary_base")
+    if base:
+        prompt = UPDATE_PROMPT.format(
+            card=base, excerpt=build_update_excerpt(info, record.get("summary_base_turns") or 0))
+    else:
+        prompt = SUMMARY_PROMPT.format(excerpt=build_excerpt(info))
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("CLAUDE_CODE_") and k not in ("CLAUDECODE", "CLAUDE_PID")}
     argv = [
@@ -561,7 +636,7 @@ def cmd_summarize(args) -> int:
     try:
         proc = subprocess.run(
             argv,
-            input=SUMMARY_PROMPT.format(excerpt=excerpt),
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=300,
@@ -578,10 +653,19 @@ def cmd_summarize(args) -> int:
         record = load_record(args.session)
     except ParkError:
         return 0
+    if record.get("summary_base") != base:
+        return 0  # re-parked meanwhile; that park owns the record now
     if ok:
         record["summary"] = proc.stdout.strip()
         record["summary_status"] = "done"
         record.pop("summary_error", None)
+        record.pop("summary_base", None)
+        record.pop("summary_base_turns", None)
+    elif base:
+        # Keep the old card rather than nothing; it predates the newest turns.
+        record["summary"] = base
+        record["summary_status"] = "stale"
+        record["summary_error"] = error or "empty response"
     else:
         record["summary_status"] = "failed"
         record["summary_error"] = error or "empty response"

@@ -16,6 +16,7 @@ cp = SourceFileLoader("claude_park", str(SCRIPT)).load_module()
 FAKE_CLAUDE = """#!/bin/sh
 log="$FAKE_CLAUDE_LOG"
 if [ "$1" = "-p" ]; then
+  echo call >> "$log.calls"
   printf '%s\\n' "$@" > "$log.args"
   cat > "$log.stdin"
   if [ -n "$FAKE_CLAUDE_FAIL" ]; then echo "boom" >&2; exit 3; fi
@@ -165,8 +166,25 @@ class CliTests(unittest.TestCase):
         self.e = Env()
         self.addCleanup(self.e.cleanup)
 
-    def park(self, session_id, *args, cwd=None):
-        return self.e.run("park", "--no-pr", "--session", session_id, *args, cwd=cwd)
+    def park(self, session_id, *args, cwd=None, extra_env=None):
+        return self.e.run("park", "--no-pr", "--session", session_id, *args,
+                          cwd=cwd, extra_env=extra_env)
+
+    def append_turns(self, path, *texts):
+        with open(path, "a") as f:
+            for text in texts:
+                f.write(json.dumps(entry("user", text, cwd=str(self.e.worktree))) + "\n")
+                f.write(json.dumps(entry("assistant", [{"type": "text", "text": "ok: " + text}],
+                                         cwd=str(self.e.worktree))) + "\n")
+
+    def summary_calls(self):
+        calls = Path(f"{self.e.fake_log}.calls")
+        return len(calls.read_text().splitlines()) if calls.exists() else 0
+
+    def park_and_resume(self, sid):
+        self.assertEqual(self.park(sid).returncode, 0)
+        self.assertEqual(self.e.wait_summary(sid)["summary_status"], "done")
+        self.assertEqual(self.e.run("resume", sid).returncode, 0)
 
     def test_park_locks_worktree_and_generates_haiku_summary(self):
         sid = "11111111-aaaa-bbbb-cccc-000000000001"
@@ -308,6 +326,60 @@ class CliTests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("no longer exists", res.stderr)
         self.assertTrue((self.e.config / "parked" / f"{sid}.json").exists())
+
+    def test_repark_without_new_turns_reuses_card(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000011"
+        path = self.e.transcript(sid, self.e.worktree)
+        self.park_and_resume(sid)
+        # Resuming appends metadata but no conversation turns.
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "last-prompt", "lastPrompt": "now write the tests"}) + "\n")
+            f.write(json.dumps(entry("user", "<command-name>/clear</command-name>")) + "\n")
+
+        res = self.park(sid)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("reusing previous card", res.stdout)
+        r = self.e.record(sid)
+        self.assertEqual(r["summary_status"], "done")
+        self.assertIn("ship the widget", r["summary"])
+        self.assertEqual(self.summary_calls(), 1)
+
+    def test_repark_with_new_turns_updates_card_from_new_turns_only(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000012"
+        path = self.e.transcript(sid, self.e.worktree)
+        self.park_and_resume(sid)
+        self.append_turns(path, "add the CSV exporter")
+
+        self.assertEqual(self.park(sid).returncode, 0)
+        r = self.e.wait_summary(sid)
+        self.assertEqual(r["summary_status"], "done", r.get("summary_error"))
+        self.assertEqual(self.summary_calls(), 2)
+        prompt = Path(f"{self.e.fake_log}.stdin").read_text()
+        self.assertIn("<previous_card>", prompt)
+        self.assertIn("ship the widget", prompt)
+        self.assertIn("add the CSV exporter", prompt)
+        self.assertNotIn("please build the widget parser", prompt)
+        self.assertEqual(r["turn_count"], 4)
+        self.assertNotIn("summary_base", r)
+
+    def test_failed_update_keeps_stale_card_and_next_park_retries(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000013"
+        path = self.e.transcript(sid, self.e.worktree)
+        self.park_and_resume(sid)
+        self.append_turns(path, "add the CSV exporter")
+
+        self.assertEqual(self.park(sid, extra_env={"FAKE_CLAUDE_FAIL": "1"}).returncode, 0)
+        r = self.e.wait_summary(sid)
+        self.assertEqual(r["summary_status"], "stale")
+        self.assertIn("ship the widget", r["summary"])
+        self.assertIn("predates the latest turns", self.e.run("show", sid).stdout)
+
+        # Re-parking must retry the update, not treat the stale card as current.
+        res = self.park(sid)
+        self.assertNotIn("reusing", res.stdout)
+        r = self.e.wait_summary(sid)
+        self.assertEqual(r["summary_status"], "done", r.get("summary_error"))
+        self.assertIn("add the CSV exporter", Path(f"{self.e.fake_log}.stdin").read_text())
 
     def test_list_and_ambiguous_lookup(self):
         for n, title in (("11", "Widget parser"), ("12", "Widget docs")):

@@ -50,6 +50,12 @@ write its own card instead. That costs nothing extra while the cache is live.
 | ctrl-x | drop: unpark without resuming |
 
 Resuming unlocks the worktree and moves the card to `~/.claude/parked/archive/`.
+Parking the same session again starts from that card. With no new
+conversation turns, it reuses the card as is, without a model call. With new
+turns, Haiku updates the old card from only the new turns. That way, context
+that has scrolled out of the excerpt window survives repeated park/resume
+cycles. If the update fails, the old card stays, marked stale, and the next
+park retries the update.
 The first turn after `--resume` re-sends the full history, which is
 unavoidable. Use ctrl-f to skip that cost when the card is enough.
 
