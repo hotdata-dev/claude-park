@@ -36,6 +36,9 @@ REBUILDABLE = {
     "__pycache__",
 }
 
+MARKER = "PARKED.md"
+MARKER_TAG = "<!-- claude-park marker -->"
+
 EXCERPT_BUDGET = 60_000
 TURN_LIMIT = 3_000
 NOISE_PREFIXES = (
@@ -318,6 +321,26 @@ def worktree_lock_reason(toplevel: str) -> Optional[str]:
     return None
 
 
+def ensure_excluded(toplevel: str, name: str) -> None:
+    """Hide a root-level file from git status in every worktree of the repo."""
+    code, common = git(toplevel, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if code != 0 or not common:
+        return
+    exclude = Path(common) / "info" / "exclude"
+    pattern = f"/{name}"
+    try:
+        lines = exclude.read_text().splitlines()
+    except OSError:
+        lines = []
+    if pattern in lines:
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with open(exclude, "a") as f:
+        if lines and lines[-1] != "":
+            f.write("\n")
+        f.write(f"# added by claude-park\n{pattern}\n")
+
+
 def pr_info(cwd: str) -> Optional[dict]:
     if not shutil.which("gh"):
         return None
@@ -494,6 +517,46 @@ def render_card(r: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def marker_path(record: dict) -> Optional[Path]:
+    top = (record.get("git") or {}).get("toplevel")
+    return Path(top) / MARKER if top else None
+
+
+def is_our_marker(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            return f.readline().strip() == MARKER_TAG
+    except OSError:
+        return False
+
+
+def write_marker(record: dict) -> bool:
+    """Leave a note in the worktree so nobody mistakes it for abandoned."""
+    path = marker_path(record)
+    if not path or not path.parent.is_dir():
+        return False
+    if path.exists() and not is_our_marker(path):
+        return False
+    ensure_excluded(str(path.parent), MARKER)
+    sid = record["session_id"]
+    path.write_text(
+        f"{MARKER_TAG}\n"
+        f"> **This worktree is parked, not abandoned.** A Claude Code session was "
+        f"shelved here on {record['parked_at'][:10]} and will be resumed. Do not "
+        f"remove this worktree, its branch, its uncommitted changes, or this file.\n"
+        f">\n"
+        f"> Resume: `parked resume {sid}` · Release: `parked drop {sid}`\n\n"
+        + render_card(record)
+    )
+    return True
+
+
+def remove_marker(record: dict) -> None:
+    path = marker_path(record)
+    if path and is_our_marker(path):
+        path.unlink(missing_ok=True)
+
+
 def goal_line(r: dict) -> str:
     summary = r.get("summary") or ""
     m = re.search(r"\*\*Goal\*\*[\s—:-]*(.+)", summary)
@@ -623,6 +686,10 @@ def cmd_park(args) -> int:
             if prev:
                 record["summary_base"] = prev["summary"]
                 record["summary_base_turns"] = prev["turn_count"]
+    record["marker"] = write_marker(record)
+    if not record["marker"] and marker_path(record) and marker_path(record).exists():
+        print(f"claude-park: warning: {marker_path(record)} exists and was not written by "
+              f"claude-park; left it alone", file=sys.stderr)
     save_record(record)
 
     if record["summary_status"] == "pending":
@@ -710,6 +777,8 @@ def cmd_summarize(args) -> int:
         record["summary_status"] = "failed"
         record["summary_error"] = error or "empty response"
     save_record(record)
+    if record.get("marker"):
+        write_marker(record)
     return 0 if ok else 1
 
 
@@ -757,6 +826,7 @@ def unpark(record: dict) -> None:
         reason = worktree_lock_reason(g["toplevel"])
         if reason is not None and reason.startswith("claude-park:"):
             git(g["toplevel"], "worktree", "unlock", g["toplevel"])
+    remove_marker(record)
     archive_dir().mkdir(parents=True, exist_ok=True)
     record["unparked_at"] = now().isoformat(timespec="seconds")
     (archive_dir() / f"{record['session_id']}.json").write_text(json.dumps(record, indent=2) + "\n")

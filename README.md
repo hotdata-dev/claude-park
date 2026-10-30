@@ -32,10 +32,16 @@ write its own card instead. That costs nothing extra while the cache is live.
    worktrees, and `git worktree list` shows the reason, so other agents and
    cleanup scripts can see the worktree is parked rather than abandoned. A
    worktree that is already locked is left as it is.
-4. With `--clean`, deletes gitignored, rebuildable directories (`target`,
+4. Writes `PARKED.md` at the worktree root: a "parked, not abandoned" notice,
+   the resume command, and the card. It is hidden from `git status` through
+   the repo's `.git/info/exclude`, so it never shows up as a change. Agents
+   and scripts that ignore git locks still see it when they look in the
+   directory. A `PARKED.md` that claude-park didn't write is never
+   overwritten or deleted. Resuming or dropping the session removes the file.
+5. With `--clean`, deletes gitignored, rebuildable directories (`target`,
    `node_modules`, `.venv`, `.next`, …) and records what was freed. It only
    touches paths git reports as ignored.
-5. Starts the Haiku summary in the background, then stops the Claude process
+6. Starts the Haiku summary in the background, then stops the Claude process
    and closes the iTerm2 pane.
 
 ## Resuming
@@ -49,7 +55,7 @@ write its own card instead. That costs nothing extra while the cache is live.
 | ctrl-f | fresh session in the worktree, seeded with the park card instead of the full history |
 | ctrl-x | drop: unpark without resuming |
 
-Resuming unlocks the worktree and moves the card to `~/.claude/parked/archive/`.
+Resuming unlocks the worktree, removes `PARKED.md`, and moves the card to `~/.claude/parked/archive/`.
 Parking the same session again starts from that card. With no new
 conversation turns, it reuses the card as is, without a model call. With new
 turns, Haiku updates the old card from only the new turns. That way, context

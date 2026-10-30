@@ -437,6 +437,53 @@ class CliTests(unittest.TestCase):
         self.assertRegex(res.stdout, r"FAIL\s+turns\s+0")
         self.assertIn("not recognized", res.stdout)
 
+    def test_park_leaves_marker_hidden_from_git_status(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000019"
+        self.e.transcript(sid, self.e.worktree)
+        before = self.e.git(self.e.worktree, "status", "--porcelain")
+        self.assertEqual(self.park(sid).returncode, 0)
+
+        marker = (self.e.worktree / "PARKED.md").read_text()
+        self.assertIn("parked, not abandoned", marker)
+        self.assertIn(f"parked resume {sid}", marker)
+        self.assertIn("# Build the widget", marker)
+        self.assertEqual(self.e.git(self.e.worktree, "status", "--porcelain"), before)
+
+        # The marker picks up the summary once the background job finishes.
+        self.e.wait_summary(sid)
+        self.assertIn("ship the widget", (self.e.worktree / "PARKED.md").read_text())
+
+    def test_repark_does_not_duplicate_exclude_entry(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000020"
+        self.e.transcript(sid, self.e.worktree)
+        self.park_and_resume(sid)
+        self.assertEqual(self.park(sid, "--no-summary").returncode, 0)
+        exclude = (self.e.repo / ".git" / "info" / "exclude").read_text()
+        self.assertEqual(exclude.count("/PARKED.md"), 1)
+
+    def test_resume_and_drop_remove_marker(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000021"
+        self.e.transcript(sid, self.e.worktree)
+        self.assertEqual(self.park(sid, "--no-summary").returncode, 0)
+        self.assertTrue((self.e.worktree / "PARKED.md").exists())
+        self.assertEqual(self.e.run("resume", sid).returncode, 0)
+        self.assertFalse((self.e.worktree / "PARKED.md").exists())
+
+        self.assertEqual(self.park(sid, "--no-summary").returncode, 0)
+        self.assertEqual(self.e.run("drop", sid).returncode, 0)
+        self.assertFalse((self.e.worktree / "PARKED.md").exists())
+
+    def test_foreign_parked_md_is_never_touched(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000022"
+        self.e.transcript(sid, self.e.worktree)
+        (self.e.worktree / "PARKED.md").write_text("my own notes\n")
+        res = self.park(sid, "--no-summary")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("PARKED.md exists", res.stderr)
+        self.assertEqual((self.e.worktree / "PARKED.md").read_text(), "my own notes\n")
+        self.assertEqual(self.e.run("drop", sid).returncode, 0)
+        self.assertEqual((self.e.worktree / "PARKED.md").read_text(), "my own notes\n")
+
     def test_list_and_ambiguous_lookup(self):
         for n, title in (("11", "Widget parser"), ("12", "Widget docs")):
             sid = f"{n}111111-aaaa-bbbb-cccc-000000000000"
