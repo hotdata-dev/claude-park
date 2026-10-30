@@ -2,7 +2,8 @@
 """Add a narration band above the VHS recording and write docs/demo.gif.
 
 Needs Pillow (caption images) and ffmpeg. Caption times are seconds into the
-recording and follow the Sleeps in demo.tape; adjust both together.
+recording and follow the Sleeps in demo.tape; adjust both together. VHS
+records at 20 fps (demo.tape) so its timeline matches wall time between renders.
 """
 import subprocess
 import sys
@@ -25,13 +26,13 @@ FPS = 20
 
 # (start, end, text). Text between `backticks` is drawn in the accent color.
 CAPTIONS = [
-    (0.0, 2.9, "A long Claude Code session, half done, and something more urgent comes up."),
-    (2.9, 5.3, "Type `!park`. It is a shell command, so the model never runs."),
-    (5.3, 9.5, "Haiku summarizes it in the background, the worktree is locked, build dirs are freed, the tab closes."),
-    (9.5, 11.0, "Weeks later, in any terminal: `parked`."),
-    (11.0, 22.0, "Every parked session with its title, phase, and git state. The preview says where it stands and what is next."),
-    (22.0, 25.4, "`ctrl-o` shows the full card."),
-    (25.4, 99.0, "`enter` resumes the session in its worktree, with its full history."),
+    (0.0, 3.0, "A long Claude Code session, half done, and something more urgent comes up."),
+    (3.0, 5.8, "Type `!park`. It is a shell command, so the model never runs."),
+    (5.8, 9.6, "Haiku summarizes it in the background, the worktree is locked, build dirs are freed, the tab closes."),
+    (9.6, 11.0, "Weeks later, in any terminal: `parked`."),
+    (11.0, 21.9, "Every parked session with its title, phase, and git state. The preview says where it stands and what is next."),
+    (21.9, 26.0, "`ctrl-o` shows the full card."),
+    (26.0, 99.0, "`enter` resumes the session in its worktree, with its full history."),
 ]
 
 

@@ -15,6 +15,7 @@ Set Padding 20
 Set Theme "Catppuccin Mocha"
 Set WindowBar Colorful
 Set TypingSpeed 45ms
+Set Framerate 20
 
 # Isolate: scrub the recording machine's Claude/iTerm2 vars, point every
 # claude-park path at the throwaway fixture, and use stand-in claude and gh.
