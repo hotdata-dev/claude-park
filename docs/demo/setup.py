@@ -364,6 +364,8 @@ def main():
         f"export DEMO_SESSION_UI='{REPO / 'docs' / 'demo' / 'fake_session.py'}'",
         f"cd '{wt}'",
         "export HISTFILE=/dev/null",
+        # A fresh terminal for the second half of the demo.
+        "newtab() { cd ~; PS1='\\[\\e[1;32m\\]~\\[\\e[0m\\] \\$ '; clear; }",
         "export PS1='\\[\\e[1;32m\\]web-app-csv-export\\[\\e[0m\\] \\$ '",
     ]
     env_sh.write_text("\n".join(lines) + "\n")

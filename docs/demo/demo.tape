@@ -1,7 +1,8 @@
-# Renders docs/demo.gif. Run docs/demo/render.sh rather than vhs directly:
-# it builds the fictional fixture this tape expects first.
+# Records the terminal part of docs/demo.gif. Run docs/demo/render.sh rather
+# than vhs directly: it builds the fictional fixture first and adds captions
+# (docs/demo/compose.py) afterwards. Caption timings there follow the Sleeps here.
 
-Output docs/demo.gif
+Output "/tmp/claude-park-demo/raw.mp4"
 
 Require fzf
 
@@ -9,7 +10,7 @@ Set Shell "bash"
 Set FontFamily "Menlo"
 Set FontSize 16
 Set Width 1480
-Set Height 840
+Set Height 900
 Set Padding 20
 Set Theme "Catppuccin Mocha"
 Set WindowBar Colorful
@@ -25,29 +26,21 @@ Show
 
 # A long-running Claude Code session that has to wait. !park runs as a
 # shell command, so the session's model never runs.
-Sleep 2.5s
+Sleep 3s
 Type "!"
-Sleep 900ms
+Sleep 1.2s
 Type "park"
-Sleep 600ms
+Sleep 1.2s
 Enter
-Sleep 6s
+Sleep 4.4s
 
-# The tab is gone. Later, in any shell:
+# The tab is gone. Later, a fresh terminal:
 Hide
-Type "clear"
+Type "newtab"
 Enter
 Sleep 300ms
 Show
 Sleep 600ms
-Type "# weeks later, in any terminal"
-Enter
-Sleep 800ms
-Type "git worktree list; ls"
-Sleep 300ms
-Enter
-Sleep 3s
-
 Type "parked"
 Sleep 300ms
 Enter

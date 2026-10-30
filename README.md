@@ -147,7 +147,7 @@ python3 -m unittest discover -s tests
 
 The demo above uses fictional data in `/tmp/claude-park-demo`, with
 stand-ins for `claude` and `gh`. Rebuild it with `docs/demo/render.sh`
-(needs [VHS](https://github.com/charmbracelet/vhs) and fzf).
+(needs [VHS](https://github.com/charmbracelet/vhs), fzf, ffmpeg, and Pillow).
 
 ## License
 

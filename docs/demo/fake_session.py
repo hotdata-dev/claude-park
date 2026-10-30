@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """A mock Claude Code session screen for the demo recording.
 
-Draws a short fictional conversation and an input box. Typing `!` switches
-the box to bash mode, as in Claude Code; on Enter the command runs for real
-(against the demo fixture) and its output is shown inline. No model runs.
+Draws a short fictional conversation with the input box pinned to the bottom
+of the window, as in Claude Code. Typing `!` switches the box to bash mode;
+on Enter the command runs for real (against the demo fixture) and its output
+is shown in the conversation. No model runs.
 """
 import os
 import shutil
 import subprocess
 import sys
 import termios
+import textwrap
 import time
 import tty
 
@@ -27,62 +29,64 @@ CONVERSATION = [
                "start on that?"),
 ]
 
-
-def width() -> int:
-    return shutil.get_terminal_size((100, 30)).columns
+BOX_ROWS = 4  # rule, prompt, rule, hint
 
 
-def out(text: str) -> None:
-    sys.stdout.write(text)
-    sys.stdout.flush()
+class Screen:
+    def __init__(self):
+        size = shutil.get_terminal_size((100, 30))
+        self.cols, self.rows = size.columns, size.lines
+        self.row = 1  # next free transcript row
 
+    def out(self, text: str) -> None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
-def draw_conversation() -> None:
-    out(f"{CLAUDE}✻{RESET} {BOLD}Claude Code{RESET} {DIM}· ~/code/web-app (csv-export){RESET}\n\n")
-    out(f"{DIM}  … 58 earlier messages{RESET}\n\n")
-    for who, text in CONVERSATION:
-        if who == "user":
-            out(f"{GREY}> {text}{RESET}\n\n")
-        else:
-            out(f"⏺ {text}\n\n")
+    def line(self, text: str = "", indent: str = "", first: str = "") -> None:
+        """Write wrapped transcript text, staying above the input box."""
+        width = self.cols - len(indent) - 1
+        chunks = textwrap.wrap(text, width) or [""]
+        for i, chunk in enumerate(chunks):
+            if self.row > self.rows - BOX_ROWS - 1:
+                return
+            prefix = first if i == 0 and first else indent
+            self.out(f"\x1b[{self.row};1H\x1b[2K{prefix}{chunk}")
+            self.row += 1
 
+    def styled(self, style: str, text: str, first: str = "", indent: str = "") -> None:
+        width = self.cols - len(indent) - 1
+        for i, chunk in enumerate(textwrap.wrap(text, width) or [""]):
+            prefix = first if i == 0 and first else indent
+            self.out(f"\x1b[{self.row};1H\x1b[2K{prefix}{style}{chunk}{RESET}")
+            self.row += 1
 
-def draw_box(buf: str) -> None:
-    """Draw the input box at the cursor and leave the cursor after the input."""
-    bash = buf.startswith("!")
-    rule = (PINK if bash else DIM) + "─" * width() + RESET
-    prompt = f"{PINK}! {RESET}{buf[1:]}" if bash else f"{GREY}❯{RESET} {buf}"
-    hint = f"{PINK}! for bash mode{RESET}" if bash else f"{DIM}? for shortcuts{RESET}"
-    # \r\n, not \n: this also runs while the terminal is in raw mode.
-    out("\x1b[J" + rule + "\r\n" + prompt + "\r\n" + rule + "\r\n  " + hint)
-    # Back up to the end of the prompt line.
-    out(f"\x1b[2A\x1b[{len(prompt_text(buf)) + 1}G")
-
-
-def prompt_text(buf: str) -> str:
-    return ("! " + buf[1:]) if buf.startswith("!") else ("❯ " + buf)
-
-
-def redraw(buf: str) -> None:
-    out("\x1b[1A\r")  # to the top rule
-    draw_box(buf)
-
-
-def run_bash(cmd: str) -> None:
-    out("\x1b[1A\r\x1b[J")
-    out(f"{PINK}! {cmd}{RESET}\n")
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    lines = (proc.stdout + proc.stderr).rstrip("\n").splitlines() or ["(no output)"]
-    for i, line in enumerate(lines):
-        out(("  ⎿  " if i == 0 else "     ") + line + "\n")
-    out("\n")
+    def box(self, buf: str) -> None:
+        bash = buf.startswith("!")
+        top = self.rows - BOX_ROWS + 1
+        rule = (PINK if bash else DIM) + "─" * self.cols + RESET
+        prompt = f"{PINK}!{RESET} {buf[1:]}" if bash else f"{GREY}❯{RESET} {buf}"
+        hint = f"  {PINK}! for bash mode{RESET}" if bash else f"  {DIM}? for shortcuts{RESET}"
+        for offset, text in enumerate((rule, prompt, rule, hint)):
+            self.out(f"\x1b[{top + offset};1H\x1b[2K{text}")
+        visible = len(buf[1:]) + 2 if bash else len(buf) + 2
+        self.out(f"\x1b[{top + 1};{visible + 1}H")
 
 
 def main() -> int:
-    out("\x1b[2J\x1b[H")
-    draw_conversation()
-    out("\n")
-    draw_box("")
+    s = Screen()
+    s.out("\x1b[2J")
+    s.line(f"{CLAUDE}✻{RESET} {BOLD}Claude Code{RESET} {DIM}· ~/code/web-app (csv-export){RESET}")
+    s.line()
+    s.line(f"{DIM}  … 58 earlier messages{RESET}")
+    s.line()
+    for who, text in CONVERSATION:
+        if who == "user":
+            s.styled(GREY, text, first=f"{GREY}> {RESET}", indent="  ")
+        else:
+            s.styled("", text, first="⏺ ", indent="  ")
+        s.line()
+    s.box("")
+
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     buf = ""
@@ -98,14 +102,28 @@ def main() -> int:
                 buf = buf[:-1]
             elif ch.isprintable():
                 buf += ch
-            redraw(buf)
+            s.box(buf)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-    if buf.startswith("!"):
-        run_bash(buf[1:].strip())
-        time.sleep(1.2)
-        out(f"{DIM}  (claude-park ends the session and closes this tab){RESET}\n")
-        time.sleep(1.5)
+
+    if not buf.startswith("!"):
+        return 0
+    cmd = buf[1:].strip()
+    s.styled(PINK, cmd, first=f"{PINK}! {RESET}")
+    s.box("")
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    lines = (proc.stdout + proc.stderr).rstrip("\n").splitlines() or ["(no output)"]
+    for i, text in enumerate(lines):
+        if i == 0:
+            s.line(text.strip(), first="  ⎿  ", indent="     ")
+        else:
+            s.line(text, indent="     ")
+    s.line()
+    s.box("")
+    time.sleep(1.5)
+    s.line(f"{DIM}  claude-park ends the session and closes this tab{RESET}")
+    s.box("")
+    time.sleep(2.4)
     return 0
 
 
