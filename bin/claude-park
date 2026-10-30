@@ -163,6 +163,9 @@ def read_transcript(path: Path) -> dict:
         "branch": None,
         "first_prompt": None,
         "compact_summary": None,
+        "version": None,
+        "entries": 0,
+        "message_entries": 0,
         "turns": [],
     }
     with open(path, errors="replace") as f:
@@ -171,6 +174,10 @@ def read_transcript(path: Path) -> dict:
                 entry = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(entry, dict):
+                continue
+            info["entries"] += 1
+            info["version"] = entry.get("version") or info["version"]
             kind = entry.get("type")
             if kind == "custom-title":
                 info["custom_title"] = entry.get("customTitle") or info["custom_title"]
@@ -179,6 +186,7 @@ def read_transcript(path: Path) -> dict:
             elif kind == "last-prompt":
                 info["last_prompt"] = entry.get("lastPrompt") or info["last_prompt"]
             elif kind in ("user", "assistant"):
+                info["message_entries"] += 1
                 if entry.get("isSidechain"):
                     continue
                 if entry.get("cwd"):
@@ -197,6 +205,23 @@ def read_transcript(path: Path) -> dict:
                         info["first_prompt"] = text
                 info["turns"].append((kind, text))
     return info
+
+
+def format_problem(info: dict) -> Optional[str]:
+    """Explain why a non-empty transcript yielded nothing to summarize.
+
+    The transcript is an undocumented Claude Code file. When its format
+    changes, fail loudly instead of summarizing an empty excerpt.
+    """
+    if info["turns"] or info["entries"] == 0:
+        return None
+    version = info["version"] or "unknown"
+    if info["message_entries"] == 0:
+        detail = "no user/assistant entries"
+    else:
+        detail = f"{info['message_entries']} user/assistant entries but no readable text"
+    return (f"transcript format not recognized (Claude Code {version}): {detail}; "
+            f"claude-park may need an update")
 
 
 def clip(text: str, limit: int) -> str:
@@ -446,7 +471,10 @@ def render_card(r: dict) -> str:
         total = sum(c["bytes"] for c in r["cleaned"])
         paths = ", ".join(c["path"] for c in r["cleaned"])
         lines.append(f"- cleaned {human_bytes(total)}: {paths} (rebuild before running)")
-    lines.append(f"- session: {r['session_id']}")
+    session = f"- session: {r['session_id']}"
+    if r.get("claude_version"):
+        session += f" (Claude Code {r['claude_version']})"
+    lines.append(session)
     lines.append("")
     status = r.get("summary_status")
     if status == "stale":
@@ -556,6 +584,7 @@ def cmd_park(args) -> int:
         "first_prompt": clip(info["first_prompt"] or "", 2_000),
         "last_prompt": clip(info["last_prompt"] or "", 2_000),
         "turn_count": len(info["turns"]),
+        "claude_version": info["version"],
         "git": g,
         "pr": pr_info(cwd) if g.get("repo") and not args.no_pr else None,
         "locked_by_park": False,
@@ -577,6 +606,10 @@ def cmd_park(args) -> int:
         text = sys.stdin.read() if args.summary_file == "-" else Path(args.summary_file).read_text()
         record["summary"] = text.strip()
         record["summary_status"] = "done"
+    elif not args.no_summary and format_problem(info):
+        record["summary_status"] = "failed"
+        record["summary_error"] = format_problem(info)
+        print(f"claude-park: warning: {record['summary_error']}", file=sys.stderr)
     elif not args.no_summary:
         prev = previous_card(session_id)
         if prev and record["turn_count"] <= prev["turn_count"]:
@@ -617,6 +650,13 @@ def cmd_park(args) -> int:
 def cmd_summarize(args) -> int:
     record = load_record(args.session)
     info = read_transcript(Path(record["transcript"]))
+    problem = format_problem(info)
+    if problem:
+        record["summary_status"] = "failed"
+        record["summary_error"] = problem
+        save_record(record)
+        print(f"claude-park: {problem}", file=sys.stderr)
+        return 1
     base = record.get("summary_base")
     if base:
         prompt = UPDATE_PROMPT.format(
@@ -795,6 +835,47 @@ def cmd_pick(args) -> int:
         session=session_id, tab=key == "ctrl-t", fresh=key == "ctrl-f"))
 
 
+def cmd_doctor(args) -> int:
+    """Check that claude-park still understands Claude Code's transcripts."""
+    if args.session:
+        path = find_transcript(args.session)
+    else:
+        candidates = list((claude_home() / "projects").glob("*/*.jsonl"))
+        path = max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+    if not path:
+        print("FAIL  transcript    none found under", claude_home() / "projects")
+        return 1
+    info = read_transcript(path)
+    print(f"transcript: {path}")
+
+    def check(ok, label, value="", required=False):
+        mark = "ok" if ok else ("FAIL" if required else "--")
+        print(f"{mark:<5} {label:<20} {value}".rstrip())
+
+    problem = format_problem(info)
+    first = (info["first_prompt"] or "").splitlines()
+    check(not problem, "turns", len(info["turns"]), required=True)
+    check(bool(first), "first prompt", clip(first[0], 60) if first else "")
+    check(bool(info["custom_title"] or info["ai_title"]), "title",
+          info["custom_title"] or info["ai_title"] or "")
+    check(bool(info["cwd"]), "cwd", info["cwd"] or "")
+    check(bool(info["branch"]), "branch", info["branch"] or "")
+    check(bool(info["last_prompt"]), "last prompt")
+    check(bool(info["compact_summary"]), "compaction summary")
+    check(bool(info["version"]), "claude version", info["version"] or "")
+    if os.environ.get("CLAUDECODE"):
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        check(bool(sid), "session id env", sid, required=True)
+        problem = problem or (None if sid else "CLAUDE_CODE_SESSION_ID is not set; !park needs --session")
+    for tool in ("fzf", "gh", "osascript"):
+        check(bool(shutil.which(tool)), tool, "" if shutil.which(tool) else "not found (optional)")
+    if problem:
+        print(f"\n{problem}")
+        return 1
+    print("\n-- marks optional fields; cards are thinner without them")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="claude-park", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command")
@@ -832,6 +913,10 @@ def build_parser() -> argparse.ArgumentParser:
     drop = sub.add_parser("drop", help="unpark without resuming (unlocks the worktree)")
     drop.add_argument("session")
     drop.set_defaults(func=cmd_drop)
+
+    doctor = sub.add_parser("doctor", help="check that Claude Code transcripts are still readable")
+    doctor.add_argument("--session", help="check this session (default: most recent transcript)")
+    doctor.set_defaults(func=cmd_doctor)
 
     pick = sub.add_parser("pick", help="interactive picker (default)")
     pick.add_argument("--json", action="store_true", help=argparse.SUPPRESS)

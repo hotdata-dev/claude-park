@@ -67,6 +67,7 @@ parked show <id-prefix|title>
 parked resume [--tab] [--fresh] <id-prefix|title>
 parked drop <id-prefix|title>
 parked summarize <id-prefix|title>     # regenerate the card
+parked doctor [--session <id>]         # check transcripts are still readable
 park --clean | --no-close | --no-summary | --no-pr
 ```
 
@@ -91,6 +92,21 @@ Settings, via environment variables:
 
 - `CLAUDE_PARK_MODEL`: summary model (default `haiku`)
 - `CLAUDE_PARK_DIR`: where cards live (default `~/.claude/parked`)
+
+## Claude Code compatibility
+
+claude-park reads Claude Code's session transcripts
+(`~/.claude/projects/*/<session-id>.jsonl`) and the `CLAUDE_CODE_SESSION_ID`
+environment variable. Neither is a documented, stable interface. To keep a
+format change from quietly producing empty cards:
+
+- If a transcript has entries but no readable conversation turns, parking
+  skips the summary, marks the card as failed with "transcript format not
+  recognized (Claude Code <version>)", and prints a warning.
+- Each card records the Claude Code version that wrote the transcript.
+- `parked doctor` parses your most recent transcript (or `--session <id>`)
+  and reports which fields it found. Run it after upgrading Claude Code. It
+  exits non-zero when the format is not recognized.
 
 ## Tests
 

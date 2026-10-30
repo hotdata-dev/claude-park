@@ -30,7 +30,7 @@ printf '%s\\n' "$@" > "$log.args"
 
 def entry(kind, content, **extra):
     e = {"type": kind, "message": {"role": kind, "content": content},
-         "cwd": extra.pop("cwd", None), "gitBranch": "feature"}
+         "cwd": extra.pop("cwd", None), "gitBranch": "feature", "version": "2.1.314"}
     e.update(extra)
     return e
 
@@ -380,6 +380,62 @@ class CliTests(unittest.TestCase):
         r = self.e.wait_summary(sid)
         self.assertEqual(r["summary_status"], "done", r.get("summary_error"))
         self.assertIn("add the CSV exporter", Path(f"{self.e.fake_log}.stdin").read_text())
+
+    def unrecognized_transcript(self, sid):
+        # Plausible future format: message entries renamed and restructured.
+        return self.e.transcript(sid, self.e.worktree, [
+            {"type": "ai-title", "aiTitle": "Build the widget"},
+            {"type": "human", "version": "9.0.0", "cwd": str(self.e.worktree),
+             "payload": {"parts": [{"text": "please build the widget parser"}]}},
+            {"type": "model", "version": "9.0.0", "cwd": str(self.e.worktree),
+             "payload": {"parts": [{"text": "Parser done."}]}},
+        ])
+
+    def test_unrecognized_transcript_fails_loudly_without_calling_model(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000014"
+        self.unrecognized_transcript(sid)
+        res = self.park(sid)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("transcript format not recognized", res.stderr)
+        r = self.e.record(sid)
+        self.assertEqual(r["summary_status"], "failed")
+        self.assertIn("not recognized", r["summary_error"])
+        self.assertIn("9.0.0", r["summary_error"])
+        self.assertEqual(self.summary_calls(), 0)
+        self.assertEqual(self.e.run("summarize", sid).returncode, 1)
+        self.assertEqual(self.summary_calls(), 0)
+
+    def test_unrecognized_transcript_does_not_reuse_previous_card(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000015"
+        self.e.transcript(sid, self.e.worktree)
+        self.park_and_resume(sid)
+        self.unrecognized_transcript(sid)
+        self.park(sid)
+        r = self.e.record(sid)
+        self.assertEqual(r["summary_status"], "failed")
+
+    def test_card_records_claude_code_version(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000016"
+        self.e.transcript(sid, self.e.worktree)
+        self.assertEqual(self.park(sid, "--no-summary").returncode, 0)
+        self.assertEqual(self.e.record(sid)["claude_version"], "2.1.314")
+        self.assertIn("Claude Code 2.1.314", self.e.run("show", sid).stdout)
+
+    def test_doctor_reports_recognized_fields(self):
+        self.e.transcript("11111111-aaaa-bbbb-cccc-000000000017", self.e.worktree)
+        res = self.e.run("doctor")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("11111111-aaaa-bbbb-cccc-000000000017", res.stdout)
+        self.assertRegex(res.stdout, r"ok\s+turns\s+2")
+        self.assertRegex(res.stdout, r"ok\s+title\s+Build the widget")
+        self.assertRegex(res.stdout, r"--\s+compaction summary")
+
+    def test_doctor_fails_on_unrecognized_format(self):
+        self.unrecognized_transcript("11111111-aaaa-bbbb-cccc-000000000018")
+        res = self.e.run("doctor")
+        self.assertEqual(res.returncode, 1)
+        self.assertRegex(res.stdout, r"FAIL\s+turns\s+0")
+        self.assertIn("not recognized", res.stdout)
 
     def test_list_and_ambiguous_lookup(self):
         for n, title in (("11", "Widget parser"), ("12", "Widget docs")):
