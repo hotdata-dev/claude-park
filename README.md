@@ -109,7 +109,7 @@ park --no-clean | --no-close | --no-summary | --no-pr
 ```
 
 Requires macOS, Python 3.9+, and git. iTerm2 is needed to close and open
-tabs; elsewhere parking still works but the tab stays open. fzf (for the
+tabs; elsewhere parking still ends the session but leaves the tab open. fzf (for the
 picker) and gh (for PR links) are optional.
 
 To install the optional `/park` skill:
