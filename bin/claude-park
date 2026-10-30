@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -35,6 +36,8 @@ REBUILDABLE = {
     ".gradle",
     "__pycache__",
 }
+
+PHASES = ["research", "design", "build", "review", "wrap-up"]
 
 MARKER = "PARKED.md"
 MARKER_TAG = "<!-- claude-park marker -->"
@@ -98,6 +101,32 @@ Be specific: name files, branches, PRs, commands, and decisions. No preamble.
 <new_turns>
 {excerpt}
 </new_turns>
+"""
+
+
+BRIEF_PROMPT = """Below is a park card for a paused Claude Code session, plus \
+git facts about its worktree. Return only a JSON object, no prose:
+
+{{"title": "...", "phase": "...", "status": "...", "next": ["...", "..."]}}
+
+- title: at most 6 words and 40 characters naming the work itself: the \
+feature, bug, or question. Never generic ("Prior session next steps", \
+"Issue 2277", "Review session abc"); say what it is actually about.
+- phase: how far along the overall task is, one of: research \
+(investigating), design (choosing an approach, writing a plan), build \
+(implementing), review (PR open, addressing feedback, validating), wrap-up \
+(essentially done; cleanup or follow-ups only). Judge the whole task, not one \
+PR: a merged PR can be one step of a larger effort.
+- status: one sentence, at most 25 words, on where things stand.
+- next: up to 3 next steps, most important first, at most 12 words each.
+
+<git_facts>
+{facts}
+</git_facts>
+
+<park_card>
+{card}
+</park_card>
 """
 
 
@@ -231,6 +260,12 @@ def clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + " …[truncated]"
+
+
+def short(text: str, limit: int) -> str:
+    """Truncate for display, keeping the result within limit characters."""
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
 def build_excerpt(info: dict, budget: int = EXCERPT_BUDGET) -> str:
@@ -445,12 +480,13 @@ def resolve(query: str) -> dict:
     hits = [r for r in records if r["session_id"].startswith(query)]
     if not hits:
         q = query.lower()
-        hits = [r for r in records if q in (r.get("title") or "").lower()]
+        hits = [r for r in records
+                if any(q in (t or "").lower() for t in (r.get("title"), display_title(r), r.get("name")))]
     if len(hits) == 1:
         return hits[0]
     if not hits:
         raise ParkError(f"no parked session matches {query!r}")
-    names = ", ".join(f"{r['session_id'][:8]} ({r.get('title')})" for r in hits)
+    names = ", ".join(f"{r['session_id'][:8]} ({display_title(r)})" for r in hits)
     raise ParkError(f"{query!r} is ambiguous: {names}")
 
 
@@ -472,8 +508,112 @@ def human_bytes(n: int) -> str:
     return f"{size:.1f}TB"
 
 
+def display_title(r: dict) -> str:
+    brief = r.get("brief") or {}
+    return brief.get("title") or r.get("title") or r["session_id"]
+
+
+def git_state(r: dict) -> str:
+    """Short, factual worktree state: PR, commits ahead, uncommitted files."""
+    g = r.get("git") or {}
+    parts = []
+    if r.get("pr"):
+        parts.append(f"PR #{r['pr']['number']} {r['pr']['state'].lower()}")
+    elif g.get("ahead"):
+        parts.append(f"{g['ahead']} ahead")
+    if g.get("dirty_files"):
+        parts.append(f"{g['dirty_files']} uncommitted")
+    return " · ".join(parts) or ("no changes" if g.get("repo") else "")
+
+
+def phase_bar(phase: Optional[str]) -> str:
+    if phase not in PHASES:
+        return ""
+    n = PHASES.index(phase) + 1
+    return "\u25b0" * n + "\u25b1" * (len(PHASES) - n)
+
+
+class Style:
+    def __init__(self, color: bool):
+        self.color = color
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\x1b[{code}m{text}\x1b[0m" if self.color and text else text
+
+    def bold(self, t): return self._wrap("1", t)
+    def dim(self, t): return self._wrap("2", t)
+    def head(self, t): return self._wrap("1;36", t)
+    def accent(self, t): return self._wrap("33", t)
+
+
+def section_items(summary: str, name: str) -> List[str]:
+    """Bullets under a **Name** heading of a Markdown card."""
+    m = re.search(rf"\*\*{name}\*\*(.*?)(?=\n\*\*\w|\Z)", summary or "", re.S)
+    if not m:
+        return []
+    items = []
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if re.match(r"^([-*]|\d+\.)\s+", line):
+            items.append(re.sub(r"^([-*]|\d+\.)\s+", "", line))
+    return items
+
+
+def render_brief(r: dict, color: bool = False, width: int = 80) -> str:
+    st = Style(color)
+    width = max(width, 40)
+    brief = r.get("brief") or {}
+    g = r.get("git") or {}
+
+    def wrap(text: str, indent: str) -> List[str]:
+        return textwrap.wrap(text, width, initial_indent=indent, subsequent_indent=indent) or [indent]
+
+    meta = [g.get("repo_name") or Path(r["cwd"]).name]
+    if g.get("branch"):
+        meta.append(g["branch"])
+    if git_state(r):
+        meta.append(git_state(r))
+    lines = [st.bold(display_title(r))]
+    lines += [st.dim(l) for l in wrap(" · ".join(meta), "")]
+    progress = f"parked {age(r['parked_at'])} ago"
+    if brief.get("phase"):
+        progress = f"{st.accent(phase_bar(brief['phase']))} {brief['phase']} · {progress}"
+    lines += [progress, ""]
+
+    status = brief.get("status") or goal_line(r)
+    steps = brief.get("next") or section_items(r.get("summary") or "", "Next")[:3]
+    if status:
+        lines.append(st.head("Where it stands"))
+        lines += wrap(status, "  ")
+        lines.append("")
+    if steps:
+        lines.append(st.head("Next"))
+        for i, step in enumerate(steps, 1):
+            lines += textwrap.wrap(step, width, initial_indent=f"  {i}. ",
+                                   subsequent_indent="     ") or [f"  {i}."]
+        lines.append("")
+    if r.get("cleaned"):
+        lines.append(st.dim("build dirs were cleaned; rebuild before running"))
+    if r.get("summary_status") == "pending":
+        lines.append(st.dim("summary is being generated…"))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def colorize_card(text: str) -> str:
+    st = Style(True)
+    out = []
+    for line in text.splitlines():
+        if line.startswith("# "):
+            line = st.bold(line[2:])
+        elif re.match(r"^- (parked|dir|branch|last commit|PR|cleaned|session)\b", line):
+            line = st.dim(line)
+        line = re.sub(r"\*\*(.+?)\*\*", lambda m: st.head(m.group(1)), line)
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def render_card(r: dict) -> str:
-    lines = [f"# {r.get('title') or r['session_id']}", ""]
+    lines = [f"# {display_title(r)}", ""]
     g = r.get("git") or {}
     lines.append(f"- parked: {r['parked_at'][:16].replace('T', ' ')} UTC ({age(r['parked_at'])} ago)")
     lines.append(f"- dir: {r['cwd']}")
@@ -640,7 +780,9 @@ def cmd_park(args) -> int:
     g = git_info(cwd)
     record = {
         "session_id": session_id,
-        "title": info["custom_title"] or info["ai_title"] or clip(info["first_prompt"] or session_id, 80),
+        # /rename names are short handles, not descriptions; keep them for search only.
+        "title": info["ai_title"] or clip(info["first_prompt"] or session_id, 80),
+        "name": info["custom_title"],
         "parked_at": now().isoformat(timespec="seconds"),
         "cwd": cwd,
         "transcript": str(transcript),
@@ -669,6 +811,7 @@ def cmd_park(args) -> int:
         text = sys.stdin.read() if args.summary_file == "-" else Path(args.summary_file).read_text()
         record["summary"] = text.strip()
         record["summary_status"] = "done"
+        record["brief_status"] = "pending"
     elif not args.no_summary and format_problem(info):
         record["summary_status"] = "failed"
         record["summary_error"] = format_problem(info)
@@ -680,9 +823,15 @@ def cmd_park(args) -> int:
             record["summary"] = prev["summary"]
             record["summary_status"] = "done"
             record["turn_count"] = prev["turn_count"]
+            if prev.get("brief"):
+                record["brief"] = prev["brief"]
+                record["brief_status"] = "done"
+            else:
+                record["brief_status"] = "pending"
             print("  reusing previous card (no new turns)")
         else:
             record["summary_status"] = "pending"
+            record["brief_status"] = "pending"
             if prev:
                 record["summary_base"] = prev["summary"]
                 record["summary_base_turns"] = prev["turn_count"]
@@ -692,10 +841,15 @@ def cmd_park(args) -> int:
               f"claude-park; left it alone", file=sys.stderr)
     save_record(record)
 
+    job = None
     if record["summary_status"] == "pending":
+        job = "summarize"
+    elif record.get("brief_status") == "pending":
+        job = "brief"
+    if job:
         logs = park_dir() / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        spawn_detached([sys.executable, os.path.abspath(__file__), "summarize", session_id],
+        spawn_detached([sys.executable, os.path.abspath(__file__), job, session_id],
                        log=logs / f"{session_id}.log")
 
     print(f"parked: {record['title']}")
@@ -730,30 +884,7 @@ def cmd_summarize(args) -> int:
             card=base, excerpt=build_update_excerpt(info, record.get("summary_base_turns") or 0))
     else:
         prompt = SUMMARY_PROMPT.format(excerpt=build_excerpt(info))
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("CLAUDE_CODE_") and k not in ("CLAUDECODE", "CLAUDE_PID")}
-    argv = [
-        claude_bin(), "-p",
-        "--model", os.environ.get("CLAUDE_PARK_MODEL", "haiku"),
-        "--no-session-persistence",
-        "--setting-sources", "",
-        "--strict-mcp-config",
-        "--tools", "",
-    ]
-    try:
-        proc = subprocess.run(
-            argv,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env,
-            cwd=str(park_dir()),
-        )
-        ok = proc.returncode == 0 and proc.stdout.strip()
-        error = (proc.stderr or proc.stdout).strip()[-500:]
-    except (OSError, subprocess.TimeoutExpired) as e:
-        proc, ok, error = None, False, str(e)
+    ok, output, error = run_model(prompt)
 
     # Re-read: the session may have been resumed or re-parked meanwhile.
     try:
@@ -763,8 +894,7 @@ def cmd_summarize(args) -> int:
     if record.get("summary_base") != base:
         return 0  # re-parked meanwhile; that park owns the record now
     if ok:
-        record["summary"] = proc.stdout.strip()
-        record["summary_status"] = "done"
+        record["summary"] = output
         record.pop("summary_error", None)
         record.pop("summary_base", None)
         record.pop("summary_base_turns", None)
@@ -776,25 +906,141 @@ def cmd_summarize(args) -> int:
     else:
         record["summary_status"] = "failed"
         record["summary_error"] = error or "empty response"
+        record.pop("brief_status", None)
+    if ok:
+        record["summary_status"] = "done"
     save_record(record)
     if record.get("marker"):
         write_marker(record)
+    if record.get("summary") and record.get("brief_status") == "pending":
+        cmd_brief(argparse.Namespace(session=args.session))
     return 0 if ok else 1
 
 
-def list_rows(records: List[dict]) -> List[str]:
-    rows = []
+def run_model(prompt: str) -> Tuple[bool, str, str]:
+    """Run a one-shot, tool-less, hook-less prompt against a cheap model."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CLAUDE_CODE_") and k not in ("CLAUDECODE", "CLAUDE_PID")}
+    argv = [
+        claude_bin(), "-p",
+        "--model", os.environ.get("CLAUDE_PARK_MODEL", "haiku"),
+        "--no-session-persistence",
+        "--setting-sources", "",
+        "--strict-mcp-config",
+        "--tools", "",
+    ]
+    park_dir().mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True,
+                              timeout=300, env=env, cwd=str(park_dir()))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, "", str(e)
+    output = proc.stdout.strip()
+    if proc.returncode == 0 and output:
+        return True, output, ""
+    return False, "", (proc.stderr or proc.stdout).strip()[-500:] or "empty response"
+
+
+def parse_brief(text: str) -> Optional[dict]:
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not str(data.get("title") or "").strip():
+        return None
+    phase = str(data.get("phase") or "").strip().lower()
+    steps = data.get("next") if isinstance(data.get("next"), list) else []
+    return {
+        "title": short(str(data["title"]), 60),
+        "phase": phase if phase in PHASES else None,
+        "status": str(data.get("status") or "").strip(),
+        "next": [str(step).strip() for step in steps if str(step).strip()][:3],
+    }
+
+
+def brief_facts(r: dict) -> str:
+    g = r.get("git") or {}
+    facts = [f"repo: {g.get('repo_name') or Path(r['cwd']).name}"]
+    if g.get("branch"):
+        facts.append(f"branch: {g['branch']}")
+    if r.get("pr"):
+        facts.append(f"PR #{r['pr']['number']} is {r['pr']['state']}: {r['pr']['title']}")
+    else:
+        facts.append("no PR for this branch")
+    if g.get("ahead") is not None:
+        facts.append(f"{g['ahead']} commits ahead of origin")
+    if g.get("dirty_files"):
+        facts.append(f"{g['dirty_files']} uncommitted files")
+    if g.get("last_commit"):
+        facts.append(f"last commit: {g['last_commit']}")
+    return "\n".join(facts)
+
+
+def cmd_brief(args) -> int:
+    """Derive the list title, phase, status, and next steps from the card."""
+    record = load_record(args.session)
+    summary = record.get("summary")
+    if not summary:
+        raise ParkError(f"{args.session} has no card to brief yet")
+    ok, output, error = run_model(BRIEF_PROMPT.format(facts=brief_facts(record), card=summary))
+    brief = parse_brief(output) if ok else None
+    try:
+        record = load_record(args.session)
+    except ParkError:
+        return 0
+    if record.get("summary") != summary:
+        return 0  # the card changed meanwhile; its own job will brief it
+    if brief:
+        record["brief"] = brief
+        record["brief_status"] = "done"
+        record.pop("brief_error", None)
+    else:
+        record["brief_status"] = "failed"
+        record["brief_error"] = error or f"unparseable brief: {clip(output, 200)}"
+    save_record(record)
+    if record.get("marker"):
+        write_marker(record)
+    return 0 if brief else 1
+
+
+def cmd_refresh(args) -> int:
+    """Regenerate briefs from existing cards; transcripts are not needed."""
+    records = [resolve(args.session)] if args.session else all_records()
+    failed = 0
     for r in records:
-        g = r.get("git") or {}
-        where = g.get("repo_name") or Path(r["cwd"]).name
-        if g.get("branch"):
-            where += f":{g['branch']}"
+        if not r.get("summary") or (r.get("brief") and not args.all):
+            continue
+        rc = cmd_brief(argparse.Namespace(session=r["session_id"]))
+        r = load_record(r["session_id"])
+        if rc == 0:
+            print(f"ok    {display_title(r)}")
+        else:
+            failed += 1
+            print(f"fail  {display_title(r)}: {r.get('brief_error')}")
+    return 1 if failed else 0
+
+
+def list_rows(records: List[dict], color: bool = False) -> List[str]:
+    """Tab-separated rows: session id, then the displayed columns."""
+    st = Style(color)
+    repos = [(r.get("git") or {}).get("repo_name") or Path(r["cwd"]).name for r in records]
+    repo_w = min(max((len(x) for x in repos), default=4), 16)
+    rows = []
+    for r, repo in zip(records, repos):
+        phase = (r.get("brief") or {}).get("phase")
+        progress = f"{phase_bar(phase)} {phase:<8}" if phase else " " * 15
+        title = short(display_title(r), 44)
+        name = f" {st.dim(r['name'])}" if r.get("name") else ""
         rows.append("\t".join([
             r["session_id"],
-            f"{age(r['parked_at']):>4}",
-            clip(r.get("title") or "", 50),
-            where,
-            clip(goal_line(r), 100),
+            st.dim(f"{age(r['parked_at']):>4}"),
+            f"{short(repo, repo_w):<{repo_w}}",
+            st.bold(f"{title:<44}") + name,
+            st.accent(progress),
+            st.dim(git_state(r)),
         ]))
     return rows
 
@@ -808,15 +1054,42 @@ def cmd_list(args) -> int:
         print("no parked sessions")
         return 0
     for row in list_rows(records):
-        sid, ago, title, where, goal = row.split("\t")
-        print(f"{sid[:8]}  {ago}  {title:<50}  {where}")
-        if goal:
-            print(f"{'':16}{goal}")
+        sid, *cols = row.split("\t")
+        print(f"{sid[:8]}  " + "  ".join(cols).rstrip())
     return 0
 
 
 def cmd_show(args) -> int:
-    sys.stdout.write(render_card(resolve(args.session)))
+    record = resolve(args.session)
+    if args.brief:
+        sys.stdout.write(render_brief(record, color=args.color))
+    else:
+        card = render_card(record)
+        sys.stdout.write(colorize_card(card) if args.color else card)
+    return 0
+
+
+def preview_mode_path() -> Path:
+    return park_dir() / ".preview-mode"
+
+
+def cmd_preview(args) -> int:
+    mode_path = preview_mode_path()
+    try:
+        mode = mode_path.read_text().strip()
+    except OSError:
+        mode = "brief"
+    if args.toggle or args.reset:
+        park_dir().mkdir(parents=True, exist_ok=True)
+        mode_path.write_text("brief" if args.reset or mode == "full" else "full")
+        return 0
+    record = resolve(args.session)
+    width = int(os.environ.get("FZF_PREVIEW_COLUMNS") or 80) - 2
+    if mode == "full":
+        sys.stdout.write(colorize_card(render_card(record)))
+    else:
+        sys.stdout.write(render_brief(record, color=True, width=width))
+        sys.stdout.write("\n" + Style(True).dim("ctrl-o: full card") + "\n")
     return 0
 
 
@@ -866,7 +1139,7 @@ def cmd_resume(args) -> int:
 def cmd_drop(args) -> int:
     record = resolve(args.session)
     unpark(record)
-    print(f"dropped: {record.get('title')} (archived; worktree unlocked)")
+    print(f"dropped: {display_title(record)} (archived; worktree unlocked)")
     return 0
 
 
@@ -880,18 +1153,22 @@ def cmd_pick(args) -> int:
         print("\ninstall fzf for an interactive picker, or run: parked resume <id|title>")
         return 0
     self_cmd = shlex.quote(os.path.abspath(__file__))
+    cmd_preview(argparse.Namespace(toggle=False, reset=True, session=None))
     proc = subprocess.run(
         [
             "fzf",
+            "--ansi",
             "--delimiter", "\t",
             "--with-nth", "2..",
             "--no-sort",
+            "--layout", "reverse",
             "--expect", "enter,ctrl-t,ctrl-f,ctrl-x",
-            "--header", "enter: resume here · ctrl-t: resume in new tab · ctrl-f: fresh session · ctrl-x: drop",
-            "--preview", f"{self_cmd} show {{1}}",
-            "--preview-window", "right,60%,wrap",
+            "--header", "enter: resume · ctrl-t: new tab · ctrl-f: fresh session · ctrl-x: drop · ctrl-o: full card",
+            "--preview", f"{self_cmd} preview {{1}}",
+            "--preview-window", "down,55%,wrap",
+            "--bind", f"ctrl-o:execute-silent({self_cmd} preview --toggle)+refresh-preview",
         ],
-        input="\n".join(list_rows(records)) + "\n",
+        input="\n".join(list_rows(records, color=True)) + "\n",
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -971,7 +1248,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser("show", help="print a parked session's card")
     show.add_argument("session")
+    show.add_argument("--brief", action="store_true", help="short view: title, phase, status, next steps")
+    show.add_argument("--color", action="store_true", help="color output with ANSI escapes")
     show.set_defaults(func=cmd_show)
+
+    preview = sub.add_parser("preview", help=argparse.SUPPRESS)
+    preview.add_argument("session", nargs="?")
+    preview.add_argument("--toggle", action="store_true")
+    preview.add_argument("--reset", action="store_true")
+    preview.set_defaults(func=cmd_preview)
+
+    brief = sub.add_parser("brief", help=argparse.SUPPRESS)
+    brief.add_argument("session")
+    brief.set_defaults(func=cmd_brief)
+
+    refresh = sub.add_parser("refresh", help="regenerate list titles and briefs from existing cards")
+    refresh.add_argument("session", nargs="?")
+    refresh.add_argument("--all", action="store_true", help="also redo cards that already have a brief")
+    refresh.set_defaults(func=cmd_refresh)
 
     resume = sub.add_parser("resume", help="resume a parked session")
     resume.add_argument("session", help="session id, id prefix, or title substring")

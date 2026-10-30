@@ -46,7 +46,20 @@ write its own card instead. That costs nothing extra while the cache is live.
 
 ## Resuming
 
-`parked` opens an fzf picker. The preview pane shows each session's card.
+`parked` opens an fzf picker with one line per session: age, repo, title,
+phase, and git state.
+
+```
+  3d  api-server    Rate limiter for the public search API        ▰▰▰▰▱ review    PR #482 open
+  9d  web-app       Migrate settings page to new form library     ▰▰▱▱▱ design    2 uncommitted
+```
+
+After the card is written, Haiku makes a second, small pass over the card to
+produce the title, phase (research → design → build → review → wrap-up), a
+one-line status, and the top three next steps. The preview shows that short
+view, and ctrl-o switches to the full card. Names set with `/rename` are
+never used as titles, but you can still search by them. `parked refresh`
+regenerates these fields from existing cards without needing transcripts.
 
 | key    | action |
 | ------ | ------ |
@@ -54,6 +67,7 @@ write its own card instead. That costs nothing extra while the cache is live.
 | ctrl-t | resume in a new iTerm2 tab |
 | ctrl-f | fresh session in the worktree, seeded with the park card instead of the full history |
 | ctrl-x | drop: unpark without resuming |
+| ctrl-o | switch the preview between the short view and the full card |
 
 Resuming unlocks the worktree, removes `PARKED.md`, and moves the card to `~/.claude/parked/archive/`.
 Parking the same session again starts from that card. With no new
@@ -69,7 +83,8 @@ Every action also works directly:
 
 ```
 parked list
-parked show <id-prefix|title>
+parked show [--brief] [--color] <id-prefix|title>
+parked refresh [--all] [<id>]          # regenerate titles and short views from cards
 parked resume [--tab] [--fresh] <id-prefix|title>
 parked drop <id-prefix|title>
 parked summarize <id-prefix|title>     # regenerate the card

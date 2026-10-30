@@ -16,11 +16,20 @@ cp = SourceFileLoader("claude_park", str(SCRIPT)).load_module()
 FAKE_CLAUDE = """#!/bin/sh
 log="$FAKE_CLAUDE_LOG"
 if [ "$1" = "-p" ]; then
+  input=$(cat)
+  case "$input" in
+    *"<park_card>"*)
+      echo call >> "$log.brief_calls"
+      printf '%s' "$input" > "$log.brief_stdin"
+      if [ -n "$FAKE_BRIEF_FAIL" ]; then echo "brief boom" >&2; exit 3; fi
+      printf '%s\\n' '```json' '{"title": "Widget parser rollout", "phase": "build", "status": "Parser works; tests remain.", "next": ["Write parser tests", "Open the PR", "Update docs", "Celebrate"]}' '```'
+      exit 0 ;;
+  esac
   echo call >> "$log.calls"
   printf '%s\\n' "$@" > "$log.args"
-  cat > "$log.stdin"
+  printf '%s' "$input" > "$log.stdin"
   if [ -n "$FAKE_CLAUDE_FAIL" ]; then echo "boom" >&2; exit 3; fi
-  printf '**Goal** — ship the widget\\n**Done**\\n- parser\\n'
+  printf '**Goal** — ship the widget\\n**Done**\\n- parser\\n**Next**\\n- tests\\n'
   exit 0
 fi
 pwd -P > "$log.cwd"
@@ -98,7 +107,7 @@ class Env:
         deadline = time.time() + timeout
         while time.time() < deadline:
             r = self.record(session_id)
-            if r["summary_status"] != "pending":
+            if r["summary_status"] != "pending" and r.get("brief_status") != "pending":
                 return r
             time.sleep(0.1)
         self.fail_reason = "summary still pending"
@@ -498,17 +507,131 @@ class CliTests(unittest.TestCase):
         for n, title in (("11", "Widget parser"), ("12", "Widget docs")):
             sid = f"{n}111111-aaaa-bbbb-cccc-000000000000"
             self.e.transcript(sid, self.e.worktree, [
-                {"type": "custom-title", "customTitle": title},
+                {"type": "ai-title", "aiTitle": title},
+                {"type": "custom-title", "customTitle": f"bee-{n}"},
                 entry("user", "do it", cwd=str(self.e.worktree)),
             ])
             self.assertEqual(self.park(sid, "--no-summary").returncode, 0)
         out = self.e.run("list").stdout
         self.assertIn("Widget parser", out)
-        self.assertIn("repo:feature", out)
+        self.assertIn("repo", out)
         res = self.e.run("show", "widget")
         self.assertEqual(res.returncode, 1)
         self.assertIn("ambiguous", res.stderr)
         self.assertIn("# Widget docs", self.e.run("show", "docs").stdout)
+        # /rename names never become the title but still find the session.
+        self.assertIn("# Widget parser", self.e.run("show", "bee-11").stdout)
+        self.assertNotIn("bee-11", self.e.record("11111111-aaaa-bbbb-cccc-000000000000")["title"])
+
+
+class BriefTests(unittest.TestCase):
+    def setUp(self):
+        self.e = Env()
+        self.addCleanup(self.e.cleanup)
+
+    def park(self, sid, *args, extra_env=None):
+        return self.e.run("park", "--no-pr", "--session", sid, *args, extra_env=extra_env)
+
+    def brief_calls(self):
+        calls = Path(f"{self.e.fake_log}.brief_calls")
+        return len(calls.read_text().splitlines()) if calls.exists() else 0
+
+    def test_parse_brief_validates_and_trims(self):
+        brief = cp.parse_brief('Sure!\n```json\n{"title": "A very long title that rambles on and on and on forever and ever", '
+                               '"phase": "Review", "status": "ok", "next": ["a", "b", "c", "d"]}\n```')
+        self.assertEqual(brief["phase"], "review")
+        self.assertEqual(brief["next"], ["a", "b", "c"])
+        self.assertLessEqual(len(brief["title"]), 61)
+        self.assertIsNone(cp.parse_brief('{"title": "x", "phase": "shipping", "status": "s", "next": []}')["phase"])
+        self.assertIsNone(cp.parse_brief("not json at all"))
+        self.assertIsNone(cp.parse_brief('{"phase": "build"}'))
+
+    def test_summary_is_followed_by_brief_from_card_and_git_facts(self):
+        sid = "22222222-aaaa-bbbb-cccc-000000000001"
+        self.e.transcript(sid, self.e.worktree)
+        self.assertEqual(self.park(sid).returncode, 0)
+        r = self.e.wait_summary(sid)
+        self.assertEqual(r["brief_status"], "done", r.get("brief_error"))
+        self.assertEqual(r["brief"]["title"], "Widget parser rollout")
+        self.assertEqual(r["brief"]["phase"], "build")
+        self.assertEqual(len(r["brief"]["next"]), 3)
+        prompt = Path(f"{self.e.fake_log}.brief_stdin").read_text()
+        self.assertIn("ship the widget", prompt)
+        self.assertIn("branch: feature", prompt)
+        self.assertNotIn("please build the widget parser", prompt)
+
+        out = self.e.run("list").stdout
+        self.assertIn("Widget parser rollout", out)
+        self.assertIn("build", out)
+        self.assertIn("\u25b0\u25b0\u25b0\u25b1\u25b1", out)
+
+    def test_brief_view_is_short_and_full_view_has_everything(self):
+        sid = "22222222-aaaa-bbbb-cccc-000000000002"
+        self.e.transcript(sid, self.e.worktree)
+        self.park(sid)
+        self.e.wait_summary(sid)
+        brief = self.e.run("show", "--brief", sid).stdout
+        self.assertIn("Widget parser rollout", brief)
+        self.assertIn("Parser works; tests remain.", brief)
+        self.assertIn("1. Write parser tests", brief)
+        self.assertIn("build", brief)
+        self.assertNotIn("**Done**", brief)
+        self.assertNotIn("\x1b[", brief)
+        full = self.e.run("show", sid).stdout
+        self.assertIn("**Done**", full)
+        colored = self.e.run("show", "--brief", "--color", sid).stdout
+        self.assertIn("\x1b[1m", colored)
+
+    def test_preview_toggles_between_brief_and_full(self):
+        sid = "22222222-aaaa-bbbb-cccc-000000000003"
+        self.e.transcript(sid, self.e.worktree)
+        self.park(sid)
+        self.e.wait_summary(sid)
+        first = self.e.run("preview", sid).stdout
+        self.assertIn("Where it stands", first)
+        self.assertNotIn("Done", first)
+        self.e.run("preview", "--toggle")
+        self.assertIn("Done", self.e.run("preview", sid).stdout)
+        self.e.run("preview", "--toggle")
+        self.assertNotIn("Done", self.e.run("preview", sid).stdout)
+
+    def test_brief_falls_back_to_card_when_missing(self):
+        sid = "22222222-aaaa-bbbb-cccc-000000000004"
+        self.e.transcript(sid, self.e.worktree)
+        self.park(sid, extra_env={"FAKE_BRIEF_FAIL": "1"})
+        r = self.e.wait_summary(sid)
+        self.assertEqual(r["summary_status"], "done")
+        self.assertEqual(r["brief_status"], "failed")
+        self.assertIn("Build the widget", self.e.run("list").stdout)
+        self.assertIn("ship the widget", self.e.run("show", "--brief", sid).stdout)
+
+    def test_refresh_backfills_briefs_from_card_without_transcript(self):
+        sid = "22222222-aaaa-bbbb-cccc-000000000005"
+        path = self.e.transcript(sid, self.e.worktree)
+        self.park(sid, extra_env={"FAKE_BRIEF_FAIL": "1"})
+        self.e.wait_summary(sid)
+        path.unlink()
+        res = self.e.run("refresh")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        r = self.e.record(sid)
+        self.assertEqual(r["brief"]["title"], "Widget parser rollout")
+        self.assertEqual(r["summary"].split("\n")[0], "**Goal** — ship the widget")
+        # Already briefed cards are skipped unless --all.
+        self.e.run("refresh")
+        self.assertEqual(self.brief_calls(), 2)
+        self.e.run("refresh", "--all")
+        self.assertEqual(self.brief_calls(), 3)
+
+    def test_reused_card_keeps_its_brief(self):
+        sid = "22222222-aaaa-bbbb-cccc-000000000006"
+        self.e.transcript(sid, self.e.worktree)
+        self.park(sid)
+        self.e.wait_summary(sid)
+        self.e.run("resume", sid)
+        self.park(sid)
+        r = self.e.wait_summary(sid)
+        self.assertEqual(r["brief"]["title"], "Widget parser rollout")
+        self.assertEqual(self.brief_calls(), 1)
 
 
 if __name__ == "__main__":
