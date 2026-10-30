@@ -361,6 +361,7 @@ def main():
     lines += [f"export {k}='{v}'" for k, v in ENV.items()]
     lines += [
         f"export CLAUDE_CODE_SESSION_ID='{LIVE_SID}'  # fictional; its transcript is in the demo dir",
+        f"export DEMO_SESSION_UI='{REPO / 'docs' / 'demo' / 'fake_session.py'}'",
         f"cd '{wt}'",
         "export HISTFILE=/dev/null",
         "export PS1='\\[\\e[1;32m\\]web-app-csv-export\\[\\e[0m\\] \\$ '",
