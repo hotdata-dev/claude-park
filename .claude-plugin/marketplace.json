@@ -1,0 +1,21 @@
+{
+  "name": "claude-park",
+  "owner": {
+    "name": "Hotdata"
+  },
+  "metadata": {
+    "description": "Park idle Claude Code sessions and resume them later.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "park",
+      "description": "/park: write a park card with the live session's own summary, lock the worktree, and close the tab.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Hotdata"
+      },
+      "source": "./plugin"
+    }
+  ]
+}

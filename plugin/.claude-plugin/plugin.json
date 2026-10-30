@@ -1,0 +1,8 @@
+{
+  "name": "park",
+  "version": "0.1.0",
+  "description": "/park: write a park card with the live session's own summary, lock the worktree, and close the tab.",
+  "author": {
+    "name": "Hotdata"
+  }
+}
