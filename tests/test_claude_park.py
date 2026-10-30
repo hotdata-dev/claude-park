@@ -524,6 +524,82 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("bee-11", self.e.record("11111111-aaaa-bbbb-cccc-000000000000")["title"])
 
 
+class TranscriptProtectionTests(unittest.TestCase):
+    """Claude Code deletes transcripts after cleanupPeriodDays; parking must not lose them."""
+
+    def setUp(self):
+        self.e = Env()
+        self.addCleanup(self.e.cleanup)
+
+    def park(self, sid, *args):
+        return self.e.run("park", "--no-pr", "--no-summary", "--session", sid, *args)
+
+    def backup(self, sid):
+        return self.e.config / "parked" / "transcripts" / f"{sid}.jsonl"
+
+    def test_park_hard_links_transcript(self):
+        sid = "33333333-aaaa-bbbb-cccc-000000000001"
+        path = self.e.transcript(sid, self.e.worktree)
+        self.assertEqual(self.park(sid).returncode, 0)
+        self.assertEqual(os.stat(self.backup(sid)).st_ino, os.stat(path).st_ino)
+
+    def test_resume_restores_transcript_deleted_by_cleanup(self):
+        sid = "33333333-aaaa-bbbb-cccc-000000000002"
+        path = self.e.transcript(sid, self.e.worktree)
+        content = path.read_text()
+        self.assertEqual(self.park(sid).returncode, 0)
+        path.unlink()  # what Claude Code's cleanup does
+
+        res = self.e.run("resume", sid)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("restored session history", res.stdout)
+        self.assertEqual(path.read_text(), content)
+        self.assertEqual(Path(f"{self.e.fake_log}.args").read_text().split(), ["--resume", sid])
+        self.assertFalse(self.backup(sid).exists())
+
+    def test_resume_without_any_history_suggests_fresh(self):
+        sid = "33333333-aaaa-bbbb-cccc-000000000003"
+        path = self.e.transcript(sid, self.e.worktree)
+        self.assertEqual(self.park(sid).returncode, 0)
+        path.unlink()
+        self.backup(sid).unlink()
+        res = self.e.run("resume", sid)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("--fresh", res.stderr)
+        self.assertTrue((self.e.config / "parked" / f"{sid}.json").exists())
+        self.assertEqual(self.e.run("resume", "--fresh", sid).returncode, 0)
+
+    def test_repark_relinks_replaced_transcript(self):
+        sid = "33333333-aaaa-bbbb-cccc-000000000004"
+        path = self.e.transcript(sid, self.e.worktree)
+        self.assertEqual(self.park(sid).returncode, 0)
+        self.assertEqual(self.e.run("resume", sid).returncode, 0)
+        # Claude Code may rewrite the file (new inode) while the session runs.
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(path.read_text())
+        tmp.replace(path)
+        self.assertEqual(self.park(sid).returncode, 0)
+        self.assertEqual(os.stat(self.backup(sid)).st_ino, os.stat(path).st_ino)
+
+    def test_drop_removes_backup(self):
+        sid = "33333333-aaaa-bbbb-cccc-000000000005"
+        self.e.transcript(sid, self.e.worktree)
+        self.assertEqual(self.park(sid).returncode, 0)
+        self.assertEqual(self.e.run("drop", sid).returncode, 0)
+        self.assertFalse(self.backup(sid).exists())
+
+    def test_list_protects_cards_parked_before_protection_existed(self):
+        sid = "33333333-aaaa-bbbb-cccc-000000000006"
+        path = self.e.transcript(sid, self.e.worktree)
+        self.assertEqual(self.park(sid).returncode, 0)
+        self.backup(sid).unlink()
+        r = self.e.record(sid)
+        r.pop("transcript_backup", None)
+        (self.e.config / "parked" / f"{sid}.json").write_text(json.dumps(r))
+        self.assertEqual(self.e.run("list").returncode, 0)
+        self.assertEqual(os.stat(self.backup(sid)).st_ino, os.stat(path).st_ino)
+
+
 class BriefTests(unittest.TestCase):
     def setUp(self):
         self.e = Env()

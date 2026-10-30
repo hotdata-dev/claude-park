@@ -444,6 +444,59 @@ def load_record(session_id: str) -> dict:
     return json.loads(path.read_text())
 
 
+def backup_path(session_id: str) -> Path:
+    return park_dir() / "transcripts" / f"{session_id}.jsonl"
+
+
+def protect_transcript(record: dict) -> bool:
+    """Hard-link the transcript into the park dir.
+
+    Claude Code deletes transcripts after cleanupPeriodDays (30 by default)
+    without activity, and a parked session has none. The link keeps the data
+    alive at no extra disk cost; resume links it back if the original is gone.
+    """
+    src = Path(record["transcript"])
+    dst = backup_path(record["session_id"])
+    if not src.exists():
+        return dst.exists()
+    if dst.exists() and os.path.samefile(src, dst):
+        record["transcript_backup"] = str(dst)
+        return True
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.unlink(missing_ok=True)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)  # different filesystem
+    record["transcript_backup"] = str(dst)
+    return True
+
+
+def protect_all(records: List[dict]) -> None:
+    for r in records:
+        if not backup_path(r["session_id"]).exists() and protect_transcript(r):
+            save_record(r)
+
+
+def restore_transcript(record: dict) -> bool:
+    """Put a cleaned-up transcript back where claude --resume looks for it."""
+    src = Path(record["transcript"])
+    if src.exists():
+        return False
+    backup = backup_path(record["session_id"])
+    if not backup.exists():
+        raise ParkError(
+            f"the session history was deleted (Claude Code's cleanupPeriodDays) and no "
+            f"backup exists; run `parked resume --fresh {record['session_id'][:8]}` to "
+            f"start a new session from the card")
+    src.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(backup, src)
+    except OSError:
+        shutil.copy2(backup, src)
+    return True
+
+
 def previous_card(session_id: str) -> Optional[dict]:
     """The last summarized card for this session, parked or archived."""
     for path in (record_path(session_id), archive_dir() / f"{session_id}.json"):
@@ -835,6 +888,7 @@ def cmd_park(args) -> int:
             if prev:
                 record["summary_base"] = prev["summary"]
                 record["summary_base_turns"] = prev["turn_count"]
+    protect_transcript(record)
     record["marker"] = write_marker(record)
     if not record["marker"] and marker_path(record) and marker_path(record).exists():
         print(f"claude-park: warning: {marker_path(record)} exists and was not written by "
@@ -1047,6 +1101,7 @@ def list_rows(records: List[dict], color: bool = False) -> List[str]:
 
 def cmd_list(args) -> int:
     records = all_records()
+    protect_all(records)
     if args.json:
         print(json.dumps(records, indent=2))
         return 0
@@ -1100,6 +1155,7 @@ def unpark(record: dict) -> None:
         if reason is not None and reason.startswith("claude-park:"):
             git(g["toplevel"], "worktree", "unlock", g["toplevel"])
     remove_marker(record)
+    backup_path(record["session_id"]).unlink(missing_ok=True)
     archive_dir().mkdir(parents=True, exist_ok=True)
     record["unparked_at"] = now().isoformat(timespec="seconds")
     (archive_dir() / f"{record['session_id']}.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -1125,6 +1181,8 @@ def cmd_resume(args) -> int:
         argv = [claude_bin(), fresh_prompt(record)]
     else:
         argv = [claude_bin(), "--resume", record["session_id"]]
+        if restore_transcript(record):
+            print("restored session history from the park backup")
     unpark(record)
     if record.get("cleaned"):
         print(f"note: build dirs were cleaned ({', '.join(c['path'] for c in record['cleaned'])})")
@@ -1133,6 +1191,7 @@ def cmd_resume(args) -> int:
         open_iterm_tab(f"cd {shlex.quote(cwd)} && {shlex.join(argv)}")
         return 0
     os.chdir(cwd)
+    sys.stdout.flush()  # exec discards unflushed output
     os.execvp(argv[0], argv)
 
 
@@ -1145,6 +1204,7 @@ def cmd_drop(args) -> int:
 
 def cmd_pick(args) -> int:
     records = all_records()
+    protect_all(records)
     if not records:
         print("no parked sessions")
         return 0
@@ -1214,6 +1274,15 @@ def cmd_doctor(args) -> int:
         sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         check(bool(sid), "session id env", sid, required=True)
         problem = problem or (None if sid else "CLAUDE_CODE_SESSION_ID is not set; !park needs --session")
+    try:
+        days = json.loads((claude_home() / "settings.json").read_text()).get("cleanupPeriodDays")
+    except (OSError, ValueError):
+        days = None
+    records = all_records()
+    protected = sum(backup_path(r["session_id"]).exists() for r in records)
+    check(protected == len(records), "history backups",
+          f"{protected}/{len(records)} parked sessions protected from "
+          f"cleanupPeriodDays ({days if days is not None else '30, default'})")
     for tool in ("fzf", "gh", "osascript"):
         check(bool(shutil.which(tool)), tool, "" if shutil.which(tool) else "not found (optional)")
     if problem:

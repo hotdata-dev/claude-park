@@ -41,7 +41,13 @@ write its own card instead. That costs nothing extra while the cache is live.
 5. Deletes gitignored, rebuildable directories (`target`, `node_modules`,
    `.venv`, `.next`, …) and records what was freed. It only touches paths git
    reports as ignored. Pass `--no-clean` to keep them.
-6. Starts the Haiku summary in the background, then stops the Claude process
+6. Hard-links the session transcript into `~/.claude/parked/transcripts/`.
+   Claude Code deletes transcripts after `cleanupPeriodDays` (30 by default)
+   without activity, and a parked session has none. With the link, the data
+   survives that cleanup at no extra disk cost. Resume links the transcript
+   back first if Claude Code removed it. Sessions parked before this existed
+   are linked the next time you run `parked`.
+7. Starts the Haiku summary in the background, then stops the Claude process
    and closes the iTerm2 pane.
 
 ## Resuming
