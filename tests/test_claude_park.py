@@ -658,6 +658,22 @@ class BriefTests(unittest.TestCase):
         colored = self.e.run("show", "--brief", "--color", sid).stdout
         self.assertIn("\x1b[1m", colored)
 
+    def test_full_card_dims_only_header_metadata(self):
+        record = {
+            "session_id": "22222222-aaaa-bbbb-cccc-000000000007",
+            "title": "Rate limiter",
+            "parked_at": cp.now().isoformat(timespec="seconds"),
+            "cwd": "/w",
+            "git": {"branch": "rate-limit"},
+            "pr": {"number": 482, "state": "OPEN", "title": "Add limiter", "url": "https://example.com/pr/482"},
+            "summary": "**Done**\n- PR #482 open; CI green\n- branch rebased on main",
+        }
+        lines = cp.colorize_card(cp.render_card(record)).splitlines()
+        dim = "\x1b[2m"
+        self.assertTrue(any(l.startswith(dim + "- PR #482 [OPEN]") for l in lines))
+        self.assertIn("- PR #482 open; CI green", lines)
+        self.assertIn("- branch rebased on main", lines)
+
     def test_preview_toggles_between_brief_and_full(self):
         sid = "22222222-aaaa-bbbb-cccc-000000000003"
         self.e.transcript(sid, self.e.worktree)

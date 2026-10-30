@@ -655,10 +655,17 @@ def render_brief(r: dict, color: bool = False, width: int = 80) -> str:
 def colorize_card(text: str) -> str:
     st = Style(True)
     out = []
+    # Metadata bullets form the block right after the title; bullets in the
+    # model-written card below must not be mistaken for them.
+    in_meta, seen_meta = False, False
     for line in text.splitlines():
-        if line.startswith("# "):
+        if line.startswith("# ") and not out:
             line = st.bold(line[2:])
-        elif re.match(r"^- (parked|dir|branch|last commit|PR|cleaned|session)\b", line):
+            in_meta = True
+        elif in_meta and not line.strip():
+            in_meta = not seen_meta
+        elif in_meta:
+            seen_meta = True
             line = st.dim(line)
         line = re.sub(r"\*\*(.+?)\*\*", lambda m: st.head(m.group(1)), line)
         out.append(line)
