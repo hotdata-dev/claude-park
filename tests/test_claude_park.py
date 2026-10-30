@@ -243,7 +243,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.e.run("drop", sid).returncode, 0)
         self.assertEqual(self.e.lock_reason(), "someone else")
 
-    def test_clean_removes_only_ignored_rebuildable_dirs(self):
+    def test_no_clean_keeps_build_dirs(self):
+        sid = "11111111-aaaa-bbbb-cccc-000000000023"
+        self.e.transcript(sid, self.e.worktree)
+        (self.e.worktree / "node_modules" / "pkg").mkdir(parents=True)
+        res = self.park(sid, "--no-summary", "--no-clean")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue((self.e.worktree / "node_modules" / "pkg").is_dir())
+        self.assertEqual(self.e.record(sid)["cleaned"], [])
+        self.assertNotIn("freed", res.stdout)
+
+    def test_park_cleans_ignored_rebuildable_dirs_by_default(self):
         sid = "11111111-aaaa-bbbb-cccc-000000000005"
         self.e.transcript(sid, self.e.worktree)
         wt = self.e.worktree
@@ -256,7 +266,7 @@ class CliTests(unittest.TestCase):
         (wt / "build").mkdir()
         (wt / "build" / "keep").write_text("untracked, not ignored")
 
-        res = self.park(sid, "--no-summary", "--clean")
+        res = self.park(sid, "--no-summary")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertFalse((wt / "node_modules").exists())
         self.assertFalse((wt / "crates" / "a" / "target").exists())

@@ -662,7 +662,7 @@ def cmd_park(args) -> int:
             git(g["toplevel"], "worktree", "lock", "--reason", reason, g["toplevel"], check=True)
             record["locked_by_park"] = True
 
-    if args.clean and g.get("repo"):
+    if not args.no_clean and g.get("repo"):
         record["cleaned"] = clean_build_dirs(g["toplevel"])
 
     if args.summary_file:
@@ -951,7 +951,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
 
     park = sub.add_parser("park", help="park the current session (run as `!park` in Claude Code)")
-    park.add_argument("--clean", action="store_true", help="delete gitignored, rebuildable build dirs")
+    park.add_argument("--no-clean", action="store_true", help="keep gitignored, rebuildable build dirs")
     park.add_argument("--no-close", action="store_true", help="leave the session and tab open")
     park.add_argument("--no-summary", action="store_true", help="skip the background Haiku summary")
     park.add_argument("--no-pr", action="store_true", help="skip the GitHub PR lookup")

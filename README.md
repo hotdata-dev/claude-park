@@ -38,9 +38,9 @@ write its own card instead. That costs nothing extra while the cache is live.
    and scripts that ignore git locks still see it when they look in the
    directory. A `PARKED.md` that claude-park didn't write is never
    overwritten or deleted. Resuming or dropping the session removes the file.
-5. With `--clean`, deletes gitignored, rebuildable directories (`target`,
-   `node_modules`, `.venv`, `.next`, …) and records what was freed. It only
-   touches paths git reports as ignored.
+5. Deletes gitignored, rebuildable directories (`target`, `node_modules`,
+   `.venv`, `.next`, …) and records what was freed. It only touches paths git
+   reports as ignored. Pass `--no-clean` to keep them.
 6. Starts the Haiku summary in the background, then stops the Claude process
    and closes the iTerm2 pane.
 
@@ -74,7 +74,7 @@ parked resume [--tab] [--fresh] <id-prefix|title>
 parked drop <id-prefix|title>
 parked summarize <id-prefix|title>     # regenerate the card
 parked doctor [--session <id>]         # check transcripts are still readable
-park --clean | --no-close | --no-summary | --no-pr
+park --no-clean | --no-close | --no-summary | --no-pr
 ```
 
 ## Install

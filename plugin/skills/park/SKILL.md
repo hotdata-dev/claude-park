@@ -1,7 +1,7 @@
 ---
 name: park
-description: Park this Claude Code session so it can be resumed weeks later. Writes a park card summarizing the session, locks the git worktree so cleanup tools leave it alone, optionally deletes rebuildable build dirs, and closes the terminal tab. Use when the user says "/park", "park this", or "park this session".
-argument-hint: "[--clean] [--no-close]"
+description: Park this Claude Code session so it can be resumed weeks later. Writes a park card summarizing the session, locks the git worktree so cleanup tools leave it alone, deletes rebuildable build dirs (unless --no-clean), and closes the terminal tab. Use when the user says "/park", "park this", or "park this session".
+argument-hint: "[--no-clean] [--no-close]"
 ---
 
 Park this session with the `claude-park` CLI, supplying your own summary.
