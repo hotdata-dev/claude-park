@@ -154,3 +154,6 @@ stand-ins for `claude` and `gh`. Rebuild it with `docs/demo/render.sh`
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+claude-park is an independent project by Hotdata, Inc. for Claude Code. It
+is not affiliated with or endorsed by Anthropic.
