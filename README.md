@@ -1,4 +1,6 @@
-# claude-park
+<h1 align="center">
+  <img src="docs/logo.png" alt="claude-park" width="220">
+</h1>
 
 You run a dozen terminal tabs, each with Claude Code in its own git worktree.
 A task is half done when something more urgent comes up, and you want to come
