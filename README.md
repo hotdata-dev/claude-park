@@ -1,5 +1,3 @@
-# claude-park
-
 <p align="center">
   <img src="docs/banner.png" alt="claude-park: Park your sessions. Pick up where you left off.">
 </p>
@@ -143,7 +141,7 @@ claude-park is designed to minimize unnecessary model calls and context reproces
 | Action | Token usage |
 | --- | --- |
 | Park with `!park` | A Haiku call summarizes a trimmed transcript excerpt; the full conversation is not re-sent to your active Claude model |
-| Park using `/park` | Uses the active session's existing context to generate the card, avoiding a separate summarization call |
+| Park using `/park` | Uses the active session's existing context to generate the card, avoiding a separate summarization call; a small Haiku call still turns the card into the picker preview |
 | Resume original session | Claude may need to re-send the full conversation history on the next turn |
 | Resume fresh session | Starts with the much smaller park card instead of the full conversation |
 | Park again with no new turns | Reuses the existing card without a model call |
