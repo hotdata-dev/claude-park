@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="docs/logo.png" alt="claude-park" width="220">
+  <img src="docs/banner.png" alt="claude-park: park your sessions, pick up where you left off">
 </h1>
 
 You run a dozen terminal tabs, each with Claude Code in its own git worktree.
