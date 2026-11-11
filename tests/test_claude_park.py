@@ -285,6 +285,41 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cleaned, {"node_modules": 2048, "crates/a/target": 100})
         self.assertIn("freed", res.stdout)
 
+    def test_freed_bytes_count_hard_links_once(self):
+        # cargo hard-links target/debug/<bin> to target/debug/deps/<bin>-<hash>;
+        # deleting both frees the data once, not twice.
+        sid = "11111111-aaaa-bbbb-cccc-000000000024"
+        self.e.transcript(sid, self.e.worktree)
+        debug = self.e.worktree / "target" / "debug"
+        (debug / "deps").mkdir(parents=True)
+        (debug / "deps" / "app-0123abcd").write_text("z" * 1000)
+        os.link(debug / "deps" / "app-0123abcd", debug / "app")
+        (debug / "build.log").write_text("l" * 10)
+
+        res = self.park(sid, "--no-summary")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse((self.e.worktree / "target").exists())
+        cleaned = {c["path"]: c["bytes"] for c in self.e.record(sid)["cleaned"]}
+        self.assertEqual(cleaned, {"target": 1010})
+
+    def test_freed_bytes_skip_files_still_linked_outside(self):
+        # A file also linked from outside the deleted dir keeps its blocks.
+        sid = "11111111-aaaa-bbbb-cccc-000000000025"
+        self.e.transcript(sid, self.e.worktree)
+        nm = self.e.worktree / "node_modules"
+        nm.mkdir()
+        (nm / "own.js").write_text("o" * 300)
+        shared = Path(self.e.tmp.name) / "store-blob"
+        shared.write_text("s" * 5000)
+        os.link(shared, nm / "shared.js")
+
+        res = self.park(sid, "--no-summary")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(nm.exists())
+        self.assertTrue(shared.exists())
+        cleaned = {c["path"]: c["bytes"] for c in self.e.record(sid)["cleaned"]}
+        self.assertEqual(cleaned, {"node_modules": 300})
+
     def test_summary_failure_is_recorded(self):
         sid = "11111111-aaaa-bbbb-cccc-000000000006"
         self.e.transcript(sid, self.e.worktree)

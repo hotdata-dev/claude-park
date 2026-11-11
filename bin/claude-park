@@ -416,14 +416,21 @@ def clean_build_dirs(toplevel: str) -> List[dict]:
 
 
 def dir_size(path: Path) -> int:
-    total = 0
+    """Bytes that deleting `path` would actually free.
+
+    Each inode counts once (cargo hard-links its outputs into deps/), and only
+    when every link to it lives under `path`; otherwise its data survives.
+    """
+    inodes = {}  # (dev, ino) -> [links seen, nlink, size]
     for root, _, files in os.walk(path):
         for name in files:
             try:
-                total += os.lstat(os.path.join(root, name)).st_size
+                st = os.lstat(os.path.join(root, name))
             except OSError:
-                pass
-    return total
+                continue
+            entry = inodes.setdefault((st.st_dev, st.st_ino), [0, st.st_nlink, st.st_size])
+            entry[0] += 1
+    return sum(size for seen, nlink, size in inodes.values() if seen >= nlink)
 
 
 # ---------------------------------------------------------------- records
